@@ -1,0 +1,239 @@
+#!/bin/sh
+#
+#   clean xenserver 
+#
+#   This program is free software; you can redistribute it and/or modify it under the 
+#   terms of the GNU General Public License as published by the Free Software Foundation;
+#   either version 3 of the License, or (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; 
+#   without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. 
+#   See the GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License along with this program; 
+#   if not, see <http://www.gnu.org/licenses/>.
+#
+clean_rootdir=0
+clean_tempdir=0
+clean_scripts=0
+
+ver="1.0.9 - 22.7.2016"
+retc=0
+ls="  "
+progname=${0##*/}
+SOURCE="${BASH_SOURCE[0]}"
+DIR="$( dirname "$SOURCE" )"
+while [ -h "$SOURCE" ]; do 
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+  DIR="$( cd -P "$( dirname "$SOURCE"  )" && pwd )"
+done
+export progdir="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
+if [ -z $fsifunc ]; then export fsifunc="/usr/bin/fsifunc.sh"; fi
+if [ -f $fsifunc ]; then
+   . $fsifunc
+   . $fsivars
+else
+   echo "ERROR cannot load fsi functions $fsifunc"
+   exit 99
+fi
+if [ -z $logfile ]; then logfile=$fsidir"/"$progname".log"; fi
+
+function help() {
+   echo
+   tput setaf 2
+   echo " Help for $progname - $ver"    
+   tput sgr0
+   echo
+   echo " clean unused files on local xenserver"
+   echo
+   tput setaf 3
+   echo "  Parameter:"
+   tput sgr0
+   echo "   -t              delete temp dir"
+   echo "   -r              delete root dir"
+   echo "   -s              delete old vi scripts"
+   echo
+   tput setaf 3
+   echo "  Optional Parameter:"
+   tput sgr0
+   echo "   -q              quiet mode"
+   echo "   -1              debug mode"
+   echo "   -2              trace mode"
+   echo "   -l <logfile>    other logfile"
+   echo
+   tput setaf 3
+   echo "  Return Code:"
+   tput sgr0
+   echo "    1 = help"
+   echo "    > = different meaning"
+   echo
+   tput setaf 3
+   echo "  Example:"
+   tput sgr0
+   echo "    $progname -t"
+   echo
+}
+
+clean_root_dir() {
+   local retc=0
+   tracemsg "$ls function [$FUNCNAME] started"
+   ls="$ls  "
+
+   infmsg "$ls  handle files in directory /root"
+
+   if [ -f /root/support.tar.bz2 ]; then
+      mv -v /root/support.tar.bz2 /var/fsi >> $logfile 2>&1
+   fi
+
+   ls=${ls:0:${#ls}-2}
+   tracemsg "$ls function [$FUNCNAME] ended - rc=$retc"
+   return $retc
+}
+
+clean_scripts() {
+   local retc=0
+   tracemsg "$ls function [$FUNCNAME] started"
+   ls="$ls  "
+
+   infmsg "$ls  delete /usr/bin/viclean.sh"
+
+   file2del=(
+      /usr/bin/viclean.sh
+      /etc/crond/viclean.cron
+      /usr/bin/viaddsearch.sh
+      /usr/bin/viclean
+      /usr/bin/vicmd.sh
+      /usr/bin/videcrypt
+      /usr/bin/vifunc.pl
+      /usr/bin/vifunc.sh
+      /usr/bin/vihaoff.sh
+      /usr/bin/fsihaoff.sh
+      /usr/bin/vihaon.sh
+      /usr/bin/fsihaon.sh
+      /usr/bin/viinfo.sh
+      /usr/bin/vimaster.sh
+      /usr/bin/vimgmtvm.pl
+      /usr/bin/vimm.sh
+      /usr/bin/vimgmtnet.pl
+      /usr/bin/vimount.sh
+      /usr/bin/vipoolauth.sh
+      /usr/bin/vipoolrun.sh
+      /usr/bin/vitsw.sh
+      /usr/bin/viupdate.pl
+)
+
+   for ((i=0; i<${#file2del[*]}; i++)); do
+      if [ -f ${file2del[$i]} ]; then
+         OUTPUT=$(2>&1 rm -v ${file2del[$i]} >> $logfile)
+         if [ $? -ne 0 ]; then
+            errmsg "delete ${file2del[$i]} [ $OUTPUT ]"
+            retc=99
+         fi
+      fi
+   done
+
+   ls=${ls:0:${#ls}-2}
+   tracemsg "$ls function [$FUNCNAME] ended - rc=$retc"
+   return $retc
+}
+
+clean_temp_dir() {
+   local retc=0
+   tracemsg "$ls function [$FUNCNAME] started"
+   ls="$ls  "
+
+   infmsg "$ls  remove files from /tmp directory"
+
+   if [ -f /tmp/xenserver-transfer-vm-6.0.0-50762p.noarch.rpm ]; then
+      rm -v /tmp/xenserver-transfer-vm-6.0.0-50762p.noarch.rpm >> $logfile 2>&1
+   fi
+
+   if ls -l /tmp/stunnel*.log >/dev/null 2>&1; then
+      rm -v /tmp/stunnel*.log >> $logfile 2>&1
+   fi
+
+   if ls -l /tmp/xenguest*.log >/dev/null 2>&1; then
+      rm -v /tmp/xenguest*.log >> $logfile 2>&1
+   fi
+
+   ls=${ls:0:${#ls}-2}
+   tracemsg "$ls function [$FUNCNAME] ended - rc=$retc"
+   return $retc
+}
+
+
+## command line arguments
+while getopts ":rstl:hq12" optname; do
+   #tracemsg "Option $optname has value $OPTARG"
+   case "$optname" in
+      "h")
+         help
+         exit 1
+        ;;
+      "q")
+         export deb2scr="no"
+         quietmode=" -q "
+         debmsg " quiet mode"
+        ;;
+      "1")
+         export deb2scr="yes"
+         export debug="debug"
+         quietmode=" -1 "
+         debmsg " debug mode"
+        ;;
+      "2")
+         export deb2scr="yes"
+         export debug="trace"
+         quietmode=" -2 "
+         debmsg " trace mode"
+        ;;
+      "l")
+         export logfile="$OPTARG"
+         debmsg " log: $logfile"
+        ;;
+      "s")
+         clean_scripts=1
+        ;;
+      "r")
+         clean_rootdir=1
+        ;;
+      "t")
+         clean_tempdir=1
+        ;;
+      "?")
+        errmsg "Unknown option $OPTARG"
+        ;;
+      ":")
+        errmsg "No argument value for option $OPTARG"
+        ;;
+      *)
+      # Should not occur
+        errmsg "Unknown error while processing options"
+        ;;
+   esac
+done
+
+## main 
+
+if [ $clean_rootdir -eq 0 ] && [ $clean_tempdir -eq 0 ] && [ $clean_scripts -eq 0 ]; then
+   help
+   exit 1
+fi
+
+infmsg "Start $progname - $ver"
+
+if [ $clean_rootdir -ne 0 ]; then
+   clean_root_dir
+fi
+
+if [ $clean_tempdir -ne 0 ]; then
+   clean_temp_dir
+fi
+
+if [ $clean_scripts -ne 0 ]; then
+   clean_scripts
+fi
+
+infmsg "End $progname rc=$retc"
+exit $retc

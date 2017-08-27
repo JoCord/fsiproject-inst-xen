@@ -1,0 +1,239 @@
+#!/bin/sh
+#
+#   vimm.sh - set or exit maintenance mode
+#
+#   This program is free software; you can redistribute it and/or modify it under the
+#   terms of the GNU General Public License as published by the Free Software Foundation;
+#   either version 3 of the License, or (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+#   without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#   See the GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License along with this program;
+#   if not, see <http://www.gnu.org/licenses/>.
+#
+job="no"
+
+ver="1.00 - 25.6.2014"
+retc=0
+ls="  "
+progname=${0##*/}
+SOURCE="${BASH_SOURCE[0]}"
+DIR="$( dirname "$SOURCE" )"
+while [ -h "$SOURCE" ]; do 
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+  DIR="$( cd -P "$( dirname "$SOURCE"  )" && pwd )"
+done
+export progdir="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
+if [ -z $fsifunc ]; then export fsifunc="/usr/bin/fsifunc.sh"; fi
+if [ -f $fsifunc ]; then
+   . $fsifunc
+   . $fsivars
+else
+   echo "ERROR cannot load fsi functions $fsifunc"
+   exit 99
+fi
+if [ -z $logfile ]; then logfile=$fsidir"/"$progname".log"; fi
+
+function help() {
+   echo
+   tput setaf 2
+   echo " Help for $progname - $ver"    
+   tput sgr0
+   echo
+   echo "  set or exit maintenance mode"
+   echo
+   tput setaf 3
+   echo "  Parameter:"
+   tput sgr0
+   echo "   -m             go in maintenance mode"
+   echo "   -e             exit maintenance mode"
+   echo "   -c             check maintenance mode rc=0 no mm, rc=1 mm activ"
+   echo
+   tput setaf 3
+   echo "  Optional:"
+   tput sgr0
+   echo "   -l <logfile>   override logfile name"
+   echo
+   tput setaf 3
+   echo "  Return Code:"
+   tput sgr0
+   echo "   0 = ok"
+   echo "   9 = help"
+   echo
+   tput setaf 3
+   echo "  Example:"
+   tput sgr0
+   echo "   $progname -m "
+   echo "   $progname -e "
+   echo
+   exit 9
+}
+
+if [ -z $1 ]; then
+   help
+fi
+
+while getopts ":hn:mcel:" optname; do
+   case "$optname" in
+      "h")
+         help
+        ;;
+      "l")
+         export logfile="$OPTARG"
+         debmsg " log: $logfile"
+        ;;
+      "m")
+         job="maintain"
+        ;;
+      "e")
+         job="exit"
+        ;;
+      "c")
+         job="check"
+        ;;
+      "?")
+        echo "Unknown option $OPTARG"
+        help
+        ;;
+      ":")
+        echo "No argument value for option $OPTARG"
+        ;;
+      *)
+      # Should not occur
+        echo "Unknown error while processing options"
+        ;;
+   esac
+done        
+
+
+   
+function mm_start_xen() {
+   local rc=0
+   tracemsg "$ls  Function [$FUNCNAME] startet"
+   ls="$ls  "
+   
+   server=${HOSTNAME%%.*}
+   if [ $rc -eq 0 ]; then
+      infmsg "$ls disable host $server now ..."
+      remotecommands="xe host-disable hostname=$server"
+      tracemsg "$ls    cmd: $remotecommands"
+      $remotecommands
+      rc=$?
+      tracemsg "$ls    rc=$rc"
+      if [ $rc -eq 0 ]; then
+         infmsg "$ls evacuate host ..."
+         remotecommands="xe host-evacuate hostname=$server"
+         $remotecommands
+         rc=$?
+         tracemsg "$ls    rc=$rc"
+      else
+         errmsg "cannot disable host $server"
+      fi
+
+
+      # ToDo: test if disable      
+      # xe host-list params=enabled  hostname=${HOSTNAME%%.*} --minimal
+      
+   fi
+
+   ls=${ls:0:${#ls}-2}
+   tracemsg "$ls  Function [$FUNCNAME] ended - rc=$rc"
+   return $rc
+}
+
+function mm_exit_xen() {
+   local rc=0
+   tracemsg "$ls  Function [$FUNCNAME] startet"
+   ls="$ls  "
+
+   server=${HOSTNAME%%.*}
+   
+   if [ $rc -eq 0 ]; then
+      infmsg "$ls enable host $server now ..."
+      remotecommands="xe host-enable host=$server"
+      tracemsg "$ls    cmd: $remotecommands"
+      $remotecommands
+      rc=$?
+   fi
+
+   ls=${ls:0:${#ls}-2}
+   tracemsg "$ls  Function [$FUNCNAME] ended - rc=$rc"
+   return $rc
+}
+
+
+function check_mm_xen() {
+   local rc=0
+   tracemsg "$ls  Function [$FUNCNAME] startet"
+   ls="$ls  "
+
+   server=${HOSTNAME%%.*}
+   
+   if [ $rc -eq 0 ]; then
+      infmsg "$ls get server mode ..."
+      remotecommands="xe host-list params=enabled hostname=$server --minimal"
+      tracemsg "$ls    cmd: $remotecommands"
+      mmrec=$($remotecommands)
+      if [ -z "$mmrec" ]; then
+         errmsg "cannot detect maintenance mode of $server"
+      elif [ "$mmrec" == "true" ]; then
+         infmsg "$ls  server $server is not in maintenance mode"   # ToDo: evtl. noch other-config auf maintenance mode: true überprüfen
+      elif [ "$mmrec" == "false" ]; then   
+         infmsg "$ls  server $server is in maintenance mode"
+         rc=1
+      else
+         errmsg "unknown result - cannot detect maintenance mode of $server"
+      fi
+   fi
+
+   ls=${ls:0:${#ls}-2}
+   tracemsg "$ls  Function [$FUNCNAME] ended - rc=$rc"
+   return $rc
+}
+
+infmsg "Start $progname - v$ver"
+infmsg " Test if toolstack online"
+wait_toolstack
+retc=$?
+if [[ $retc -ne 0 ]] ; then
+   errmsg "something wrong with toolstack - abort"
+fi
+
+
+if [ $retc -eq 0 ] ; then
+   tracemsg " job: $job"
+   case "$job" in
+     "exit")   
+         infmsg "$ls   exit maintenance mode"
+         mm_exit_xen
+         retc=$?
+         check_mm_xen
+        ;;
+     "maintain")   
+         infmsg "$ls   start maintenance mode"
+         mm_start_xen
+         retc=$?
+         check_mm_xen
+        ;;
+     "check")   
+         infmsg "$ls   check maintenance mode"
+         check_mm_xen
+         retc=$?
+        ;;
+     "no")   
+         warnmsg "$ls   no job given - what shall I do ?"
+        ;;
+     *)
+         errmsg "Unknown job [$job]"
+         exit 4
+        ;;
+   esac   
+fi
+
+
+
+infmsg "End - rc=$retc"
+exit $retc

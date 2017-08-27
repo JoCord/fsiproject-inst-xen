@@ -1,0 +1,563 @@
+#!/usr/bin/perl -w
+#
+#   vijoinad.pl - join domain
+#
+#   This program is free software; you can redistribute it and/or modify it under the
+#   terms of the GNU General Public License as published by the Free Software Foundation;
+#   either version 3 of the License, or (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+#   without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#   See the GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License along with this program;
+#   if not, see <http://www.gnu.org/licenses/>.
+#
+our $ver = "1.0.18 - 12.02.2017";
+my $retc = 0;
+my $vrun = 0;                                                                                                                      # virtual run => 1 means no xe commands, 0 means xe commands
+use strict;
+use warnings;
+my $fsidir = "/var/fsi";
+use FindBin qw($Bin);
+use lib "/var/fsi/module";
+use Config::General;
+use English;
+use Sys::Hostname;
+our $flvl = 0;                                                                                                                     # function level
+my $ll = " ";
+
+open my $file, '<', "/etc/redhat-release"; 
+my $redhatrel = <$file>; 
+close $file;
+my ($xenmain) = $redhatrel =~ /(\d+)/;   
+my $xencfg = "xen$xenmain";
+
+my $logconf  = "$fsidir/log.cfg";
+my $logfile  = "$fsidir/fsixeninst.log";
+my $conffile = "$fsidir/$xencfg.pool";
+my $confxen  = "$fsidir/$xencfg.conf";
+my %conf;
+$conf{'pool'}   = "none";
+$conf{'xenmp'}  = "none";
+$conf{'fsisrv'} = "none";
+
+use File::Spec;
+use File::Basename;
+my $rel_path = File::Spec->rel2abs(__FILE__);
+my ( $volume, $dirs, $prg ) = File::Spec->splitpath($rel_path);
+my $prgname = basename( $prg, '.pl' );
+
+use Log::Log4perl qw(:no_extra_logdie_message);
+unless ( -e $logconf ) {
+   print "\n ERROR: cannot find config file for logs $logconf !\n\n";
+   exit(101);
+}
+sub get_log_fn { return $logfile }
+
+Log::Log4perl->init($logconf);
+our $logger = Log::Log4perl::get_logger();
+
+use Net::Ping;
+
+# functions
+our $frc = 0;                                                                                                                      # global function return code for cmdget
+require "/usr/bin/fsifunc.pl";                                                                                                     # global perl routine
+## For printing colors to the console
+my ${colorRed}    = "\033[31;1m";
+my ${colorGreen}  = "\033[32;1m";
+my ${colorCyan}   = "\033[36;1m";
+my ${colorWhite}  = "\033[37;1m";
+my ${colorNormal} = "\033[m";
+my ${colorBold}   = "\033[1m";
+my ${colorNoBold} = "\033[0m";
+
+sub help {
+   print <<EOM;
+
+             ${colorBold}$prg - $ver : H E L P${colorNoBold}
+
+  ${colorGreen}XenServer pool join AD${colorNormal}
+  
+    ${colorRed}Parameter${colorNormal}
+    --mode             install mode [member/master/standalone/off]
+
+    ${colorRed}Misc${colorNormal}
+    --help             this help site
+    --sub              call as subroutine in installation part
+
+EOM
+   exit(0);
+} ## end sub help
+
+
+sub disable_domain {
+   my $fc = ( caller(0) )[ 3 ];
+   $flvl++;
+   my $ll = " " x $flvl;
+   $logger->trace("$ll func start: [$fc]");
+   my $retc       = 0;
+   my $succ_leave = 1;
+   my $max_count  = 10;
+   my $sleeptime  = 20;
+
+   do {
+      $retc = cmdset("xe pool-disable-external-auth");
+      unless ($retc) {
+         $logger->debug("$ll  domain membership off");
+         $succ_leave = $max_count;
+      } else {
+         sleep $sleeptime;
+         $succ_leave++;
+         $logger->error("cannot leave domain, retry - rc=$retc");
+      }
+   } while ( $succ_leave < $max_count );
+
+   $logger->trace("$ll func end: [$fc] rc: [$retc]");
+   $flvl--;
+   return ($retc);
+} ## end sub disable_domain
+
+sub create_hosts {
+   my $fc = ( caller(0) )[ 3 ];
+   $flvl++;
+   my $ll = " " x $flvl;
+   $logger->trace("$ll func start: [$fc]");
+   my $retc = 0;
+
+   my $file = "/etc/hosts";
+   if ( -e $file ) {
+      unless ( unlink($file) ) {
+         $logger->error( "deleting " . $file . "[$!]" );
+         $retc = 99;
+      } else {
+         $logger->info("$ll successful hosts file delete!");
+      }
+   } ## end if ( -e $file )
+
+   unless ($retc) {
+      $logger->debug("$ll  read conf ...");
+      $retc = read_config( $confxen, \%conf );
+   }
+
+   unless ($retc) {
+      my $host = hostname();
+      my $short;
+      if ( $host =~ /((.+?)|(.*?))\./ ) {
+         $short = $1;
+      } else {
+         $short = $host;
+      }
+
+      my $line = "127.0.0.1 $short.$conf{'dnsdom'} $short localhost localhost.localdomain";
+      $retc = cmdset("echo $line >>$file");
+      unless ($retc) {
+         $logger->debug("$ll  add ok");
+      } else {
+         $logger->error("cannot add [$line] to [$file]");
+      }
+   } ## end unless ($retc)
+
+   $logger->trace("$ll func end: [$fc] rc: [$retc]");
+   $flvl--;
+   return ($retc);
+} ## end sub create_hosts
+
+sub join_domain {
+   my $fc = ( caller(0) )[ 3 ];
+   $flvl++;
+   my $ll = " " x $flvl;
+
+   $logger->trace("$ll func start: [$fc]");
+
+   my $conffile = shift();
+   my $retc     = 0;
+   my $conf;
+   my %config;
+   
+   my $retries  = 10;                                                                                                                 # how much retries to join domain
+   my $waittime = 120;
+
+
+   my $addomain = "none";
+   my $dnsdom   = "none";
+   my $aduser   = "none";
+   my $adpass   = "none";
+   my $srvou    = "none";
+   my $domain;
+
+   if ( $conffile ne "" ) {
+      $logger->debug("$ll check if config file exist");
+      if ( -e $conffile ) {
+         $logger->info("$ll found $conffile");
+         $logger->trace("$ll get all config from $conffile");
+         $conf = new Config::General("$conffile");
+         $logger->debug("$ll Get all xenserver configurations ...");
+         %config = $conf->getall;
+
+         foreach $domain ( keys %{ $config{'domain'} } ) {
+            $logger->info("$ll found domain [$domain]");
+
+            $addomain = $domain;
+            $dnsdom   = "none";
+            $aduser   = "none";
+            $adpass   = "none";
+            $srvou    = "none";
+            my $domconnect = "off";
+
+            if ( defined $config{'domain'}{$domain}{'user'} ) {
+               $aduser = $config{'domain'}{$domain}{'user'};
+               $logger->info("$ll found user: $aduser");
+            }
+            if ( defined $config{'domain'}{$domain}{'ou'} ) {
+               $srvou = $config{'domain'}{$domain}{'ou'};
+               $logger->info("$ll found ou: $srvou");
+            }
+            if ( defined $config{'domain'}{$domain}{'dnsdom'} ) {
+               $dnsdom = $config{'domain'}{$domain}{'dnsdom'};
+               $logger->info("$ll found dns domain: $dnsdom");
+
+               if ( defined $config{'domain'}{$domain}{'contyp'} ) {
+                  $logger->debug("$ll found domain connection typ in config");
+                  $domconnect = $config{'domain'}{$domain}{'contyp'};
+               }
+               $logger->debug("$ll domain connect typ: $domconnect");
+               if ( "$domconnect" eq "off" ) {
+                  $logger->info("$ll domain check disabled");
+               } else {
+                  $logger->info("$ll try to check domain connection");
+                  my $p = Net::Ping->new($domconnect);
+                  if ( $p->ping($dnsdom) ) {
+                     $logger->info("$ll domain succesful connected");
+                  } else {
+                     $logger->error("cannot connect to [$dnsdom] - abort");
+                     $retc = 99;
+                  }
+               } ## end else [ if ( "$domconnect" eq "off" ) ]
+            } ## end if ( defined $config{'domain'}{$domain}{'dnsdom'} )
+            if ( defined $config{'domain'}{$domain}{'pw'} ) {
+               if ( defined $config{'domain'}{$domain}{'pwc'} ) {
+                  my $cadpasscode = $config{'domain'}{$domain}{'pwc'};
+                  my $cadpass     = $config{'domain'}{$domain}{'pw'};
+                  srand($cadpasscode);
+                  $adpass = "";
+                  $adpass .= chr( ord($_) ^ int( rand(10) ) ) for ( split( '', $cadpass ) );
+                  $logger->info("$ll found user password");
+               } else {
+                  $logger->error("cannot find password code - abort");
+                  $retc = 99;
+               }
+            } ## end if ( defined $config{'domain'}{$domain}{'pw'} )
+         } ## end foreach $domain ( keys %{ $config{'domain'} } )
+      } else {
+         $logger->error("no config file $conffile found - abort");
+         $retc = 88;
+      }
+   } else {
+      $logger->error("no config file given - abort");
+      $retc = 99;
+   }
+
+   unless ($retc) {
+      $logger->info("$ll test if domain ok ..");
+
+   }
+   unless ($retc) {
+      if ( $addomain eq "none" || $aduser eq "none" || $adpass eq "none" || $dnsdom eq "none" ) {
+         $logger->error("need domain, user and password");
+         $retc = 99;
+      } else {
+         $logger->info("$ll join domain start ...");
+
+         my $runc         = 0;
+         my $resultstring = "";
+
+         if ( $srvou eq "none" ) {
+            $logger->debug("$ll  no ou information configure");
+         } else {
+            $logger->info("$ll  found ou info");
+            $retc = create_hosts();
+         }
+
+         unless ($retc) {
+            do {
+
+               if ($vrun) {
+                  $logger->warn("$ll vrun mode");
+                  $resultstring = "";
+               } else {
+                  if ( $srvou eq "none" ) {
+                     $logger->info("$ll  join domain without ou");
+                     $resultstring = cmdget( "xe pool-enable-external-auth auth-type=AD service-name=$dnsdom config:user=$aduser config:pass='" . $adpass . "'" );
+                  } else {
+                     $logger->info("$ll  join domain with ou");
+                     $resultstring = cmdget( "xe pool-enable-external-auth auth-type=AD service-name=$dnsdom config:user=$aduser config:pass='" . $adpass . "' config:ou=\"$srvou\" config:disable_modules=hostname " );
+                  }
+               } ## end else [ if ($vrun) ]
+
+               if ( $resultstring ne "" ) {
+                  $logger->warn("$ll  something wrong - try to analyse return string");
+
+                  if ( $resultstring =~ m/HOST_OFFLINE/ ) {
+                     $logger->warn("$ll  => one host offline - wait and try again.");
+                     sleep($waittime);
+                     $retc = 0;
+                     $runc++;
+                  } elsif ( $resultstring =~ m/Active Directory Plug-in could not/ ) {
+                     $logger->warn("$ll  => one host offline - wait and try again.");
+                     sleep($waittime);
+                     $retc = 0;
+                     $runc++;
+                  } elsif ( $resultstring =~ m/The OU is invalid/ ) {
+                     $logger->error("The OU in config file is wrong");
+                     $retc         = 64;
+                     $resultstring = "";
+                  } elsif ( $resultstring =~ m/External authentication in this pool is already enabled for at least/ ) {
+                     $logger->warn("$ll  => External authentication in this pool is already enabled for at least one host - first disable ad");
+                     $retc = disable_domain();
+                     unless ($retc) {
+                        $logger->info("$ll  join domain disabled");
+                     } else {
+                        $logger->error("cannot disable - something other wrong - abort");
+                        $retc         = 67;
+                        $resultstring = "";
+                     }
+                  } elsif ( $resultstring =~ m/message: At least two hosts in the pool have the same hostname/ ) {
+                     $logger->error("Xen-Server DB inconsistent - this server exist tice - abort");
+                     $retc         = 64;
+                     $resultstring = "";
+                  } elsif ( $resultstring =~ m/fsi error in cdmget without output/ ) {
+                     $logger->error("fsi reports empty output but error code - abort");
+                     $retc         = 67;
+                     $resultstring = "";
+
+                  } else {
+                     $logger->error("====> UNKNOWN result! Please report result to fsi team");
+                     $retc         = 65;
+                     $resultstring = "";
+                  }
+
+                  if ( $runc >= $retries ) {
+                     $logger->error("to much retries - abort join ad");
+                     $retc         = 66;
+                     $resultstring = "";
+                  }
+               } ## end if ( $resultstring ne "" )
+
+            } while ( $resultstring ne "" );
+         } ## end unless ($retc)
+
+         unless ($retc) {
+            $logger->info("$ll join ok");
+         } else {
+            $logger->error("cannot join to $addomain - abort");
+            $retc = 99;                                                                                                            # return code 1 means reboot only
+         }
+      } ## end else [ if ( $addomain eq "none" || $aduser eq "none" || $adpass eq "none" || $dnsdom eq "none" ) ]
+   } ## end unless ($retc)
+
+   $logger->trace("$ll func end: [$fc] rc: [$retc]");
+   $flvl--;
+   return ($retc);
+} ## end sub join_domain
+
+
+sub create_groups {
+   my $fc = ( caller(0) )[ 3 ];
+   $flvl++;
+   my $ll = " " x $flvl;
+
+   $logger->trace("$ll func start: [$fc]");
+
+   my $conffile = shift();
+   my $retc     = 0;
+   my $conf;
+   my %config;
+
+   my $domain;
+   my $group;
+   my $role;
+   my $retuuid;
+
+   if ( $conffile ne "" ) {
+      $logger->debug("$ll check if config file exist");
+      if ( -e $conffile ) {
+         $logger->info("$ll found $conffile");
+         $logger->trace("$ll get all config from $conffile");
+         $conf = new Config::General("$conffile");
+         $logger->debug("$ll Get all xenserver configurations ...");
+         %config = $conf->getall;
+
+         foreach $domain ( keys %{ $config{'domain'} } ) {
+            $logger->debug("$ll found domain $domain");
+            foreach $group ( keys %{ $config{'domain'}{$domain}{'group'} } ) {
+               $logger->debug("$ll found group definition");
+               if ( defined $config{'domain'}{$domain}{'group'}{$group}{'role'} ) {
+                  $role = $config{'domain'}{$domain}{'group'}{$group}{'role'};
+                  $logger->info("$ll found group role : $role");
+                  $logger->info("$ll search if group already exist in xen pool");
+                  $logger->trace("$ll  domain: [$domain]");
+                  $logger->trace("$ll  group: [$group]");
+                  $logger->trace("$ll  uuid set to zero");
+                  $retuuid = "";
+                  if ($vrun) {
+                     $logger->warn("$ll  vrun mode");
+                     $retuuid = "02394s0dfs";
+                  } else {
+                     $retuuid = cmdget("xe subject-list |grep -i -B 3 \"$group\" |grep uuid |awk '{print \$5}'");
+                     $logger->debug("$ll  uuid: [$retuuid]");
+                  }
+
+                  if ( $retuuid eq "" ) {
+                     $logger->info("$ll $domain\\$group does not exist - create");
+                     $logger->debug("$ll try to set group role ...");
+                     $logger->debug("$ll applying ad groups in the buildin roles ...");
+                     if ($vrun) {
+                        $logger->warn("$ll vrun mode");
+                        $retc = 0;
+                     } else {
+                        $logger->trace("$ll   domain: [$domain]");
+                        $logger->trace("$ll   group: [$group]");
+                        $retc = cmdset("xe subject-add subject-name=\"$domain\\$group\"");
+                     }
+                     if ($retc) {
+                        $logger->error("xen subject for $domain\\$group failed - abort");
+                     } else {
+                        $logger->debug("$ll get uuid from groups ...");
+                        if ($vrun) {
+                           $logger->warn("$ll vrun mode");
+                           $retuuid = "02394s0dfs";
+                        } else {
+                           $retuuid = cmdget("xe subject-list |grep -i -B 3 \"$group\" |grep uuid |awk '{print \$5}'");
+                        }
+                     } ## end else [ if ($retc) ]
+                     unless ($retc) {
+                        if ( $retuuid ne "" ) {
+                           $logger->debug("$ll uuid: $retuuid");
+                           $logger->debug("$ll add role to groups ...");
+                           if ($vrun) {
+                              $logger->warn("$ll vrun mode");
+                              $retc = 0;
+                           } else {
+                              $retc = cmdset("xe subject-role-add uuid=$retuuid role-name=$role");
+                           }
+                        } else {
+                           $logger->error("$ll something wrong getting uuid - abort");
+                           $retc = 99;
+                           last;
+                        }
+                     } ## end unless ($retc)
+                  } else {
+                     $logger->info("$ll $domain\\$group already exist - do not create");
+                  }
+               } ## end if ( defined $config{'domain'}{$domain}{'group'}{$group}{'role'} )
+            } ## end foreach $group ( keys %{ $config{'domain'}{$domain}{'group'} } )
+         } ## end foreach $domain ( keys %{ $config{'domain'} } )
+      } else {
+         $logger->error("no config file $conffile found - abort");
+         $retc = 88;
+      }
+   } else {
+      $logger->error("no config file given - abort");
+      $retc = 99;
+   }
+
+   $logger->trace("$ll func end: [$fc] rc: [$retc]");
+   $flvl--;
+   return ($retc);
+} ## end sub create_groups
+
+
+# main ------------------------------------------------------------------------------------------------------------------------------------
+
+my $counter = 0;
+my $mode    = "none";
+if ( $#ARGV eq '-1' ) { help() }
+
+my @ARGS    = @ARGV;
+my $numargv = @ARGS;
+
+for ( $counter = 0 ; $counter < $numargv ; $counter++ ) {
+   $logger->debug("$ll  Argument: $ARGS[$counter]");
+   if ( $ARGS[ $counter ] =~ /^-h$/i ) {
+      help();
+   } elsif ( $ARGS[ $counter ] eq "" ) {
+      ## Do nothing
+   } elsif ( $ARGS[ $counter ] =~ /^--help/ ) {
+      help();
+   } elsif ( $ARGS[ $counter ] =~ /^--sub/ ) {
+      $ll = " " x 4;
+      $flvl = 5;
+   } elsif ( $ARGS[ $counter ] =~ /^--mode$/ ) {
+      $counter++;
+      if ( $ARGS[ $counter ] && $ARGS[ $counter ] !~ /^-/ ) {
+         $mode = $ARGS[ $counter ];
+         chomp($mode);
+         $mode =~ s/\n|\r//g;
+      } else {
+         $logger->error(" The argument after --mode was not correct - ignore!");
+         $counter--;
+      }
+   } else {
+      $logger->warn("$ll  Unknown option [$ARGS[$counter]]- ignore");
+   }
+} ## end for ( $counter = 0 ; $counter < $numargv ; $counter++ )
+
+$logger->info("$ll Starting $prg - v.$ver");
+$logger->info("$ll  Mode: $mode");
+
+if ( $mode ne "none" ) {
+   if ( $mode eq "master" ) {
+      $logger->info("$ll  join domain first");
+      $retc = join_domain($conffile);
+      unless ($retc) {
+         $logger->info("$ll  join domain successful");
+         $logger->info("$ll  create group");
+         $retc = create_groups($conffile);
+      }
+   } elsif ( $mode eq "jpfirst" ) {
+      $logger->info("$ll  first join pool to get all network settings, than join domain");
+      $retc = 0;
+   } elsif ( $mode eq "authlocal" ) {
+      $logger->info("$ll  no domain join need - local auth configure");
+      $retc = 0;
+   } elsif ( $mode eq "standalone" ) {
+      $logger->warn("$ll  standalone xen server needs no domain join");
+      $retc = 0;
+   } elsif ( $mode eq "member" ) {
+      $logger->info("$ll  join domain need");
+      $retc = join_domain($conffile);
+      unless ($retc) {
+         $logger->info("$ll  join domain successful");
+      }
+   } elsif ( $mode eq "off" ) {
+      $logger->info("$ll  join domain disabled or off");
+      $retc = disable_domain();
+      unless ($retc) {
+         $logger->info("$ll  join domain disabled");
+      }
+   } else {
+      $logger->error(" unknown mode - abort");
+      $retc = 99;
+   }
+} else {
+   $logger->error(" no install mode set - abort");
+   $retc = 99;
+}
+
+
+if ($retc) {
+   $logger->error(" something wrong - see log file for more detailed errors");
+}
+
+$logger->info("$ll End $prg - v.$ver rc=$retc");
+exit($retc);
+
+
+__END__
+
+
+
+
+ 
+

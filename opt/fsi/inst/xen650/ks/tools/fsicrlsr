@@ -1,0 +1,541 @@
+#!/usr/bin/perl -w
+# 
+#   create or destroy lun storage repository
+#
+#   This program is free software; you can redistribute it and/or modify it under the 
+#   terms of the GNU General Public License as published by the Free Software Foundation;
+#   either version 3 of the License, or (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; 
+#   without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. 
+#   See the GNU General Public License for more details.
+#  
+#   You should have received a copy of the GNU General Public License along with this program; 
+#   if not, see <http://www.gnu.org/licenses/>.
+#
+our $ver = "1.0.7 - 17.03.2017";
+my $retc = 0;
+use strict;
+use warnings;
+my $fsidir="/var/fsi";
+use FindBin qw($Bin);
+use lib "/var/fsi/module";
+use Config::General;
+use English;
+use Sys::Hostname;
+our $flvl = 0;                                                                                                                   # function level
+my $ll = " ";
+my $bequiet = 0;
+
+open my $file, '<', "/etc/redhat-release"; 
+my $redhatrel  = <$file>; 
+close $file;
+my ($xenmain)  = $redhatrel =~ /(\d+)/;   
+my $xencfg     = "xen$xenmain";
+
+my $logconf    = "$fsidir/log.cfg";
+my $logfile    = "$fsidir/fsixeninst.log";
+my $conffile   = "$fsidir/$xencfg.pool";
+my $xenconf    = "$fsidir/$xencfg.conf";
+
+my $luncounter = 0;
+
+use File::Spec; 
+use File::Basename;
+my $rel_path = File::Spec->rel2abs( __FILE__ );
+my ($volume,$dirs,$prg) = File::Spec->splitpath( $rel_path );
+my $prgname = basename($prg, '.pl');
+
+use Log::Log4perl qw(:no_extra_logdie_message);
+unless (-e $logconf) {
+   print "\n ERROR: cannot find config file for logs $logconf !\n\n";
+   exit(101);
+}
+sub get_log_fn { return  $logfile };
+
+use XML::Simple qw(:strict);
+
+Log::Log4perl->init( $logconf );
+our $logger = Log::Log4perl::get_logger();
+
+# functions
+our $frc  = 0;                                                                                                                  # global function return code for cmdget
+require "/usr/bin/fsifunc.pl";                                                                                                  # global perl routine
+our %color;
+my $uuids="ALL";
+
+sub help {
+   print <<EOM;
+
+  $color{'bold'}Help for $prg - $ver$color{'nobold'}
+
+  $color{'green'}List, create or destroy fibre channel LUNs storage repositories $color{'normal'}
+  
+    $color{'red'}Do$color{'normal'}
+     --do list                list existing sr luns
+     --do new                 list probed luns
+     --do print               print only xml probe result (with rc=0)
+     --do create              create all new luns
+     --do destroy             destroy and delete the given sr(s) (use with --uuid)
+
+    $color{'red'}Optional$color{'normal'}
+     --uuid <uuid>[,<uuid>]   only lun(s) with this uuid(s)
+     --quiet                  print only information
+
+    $color{'red'}Misc$color{'normal'}
+     --help                   this help site
+    
+
+EOM
+   exit(0);
+} ## end sub help
+
+sub list_luns {
+   my $fc = ( caller(0) )[ 3 ];
+   $flvl++;
+   my $ll = " " x $flvl;
+   $logger->trace("$ll func start: [$fc]");
+   my $retc=0;
+   my $listcounter=0;
+
+   my $poolname=cmdget("xe pool-list params=name-label --minimal");
+   $poolname=lc($poolname);
+   my $srcount=00;
+   my $teststring="fc_${poolname}_";
+   
+   my $srlist=cmdget("xe sr-list type=lvmohba params=name-label --minimal");
+   my @srarray=split(/,/,$srlist);
+   foreach my $sr ( @srarray ){ 
+      $logger->info("$ll  sr: $sr ");
+      if ( $sr =~ m/^$teststring/ ) {
+         $listcounter++;
+         if ( $bequiet ) {
+            print "$sr\n";
+         }
+         $logger->trace("$ll  found a fc sr with poolname: $sr");
+         my $tempcount=substr($sr,-2);
+         if ( $tempcount > $srcount ) {
+            $srcount = sprintf ("%02d",$tempcount);
+            $logger->trace("$ll new sr count: $srcount");
+         }
+      }
+   }
+   $logger->info("$ll  sr count: $srcount");
+   $srcount++;
+   $srcount = sprintf ("%02d",$srcount);
+
+   $logger->info("$ll  next sr count: $srcount");
+   if ( $listcounter > 0 ) {
+      $logger->info("$ll $listcounter existing lun sr found");
+   } else {
+      $logger->info("$ll no esxiting lun sr found");
+   }
+
+   $logger->trace("$ll func end: [$fc] - rc=$retc");
+   $flvl--;
+   return ($retc,$listcounter);
+}
+
+sub print_luns {
+   my $fc = ( caller(0) )[ 3 ];
+   $flvl++;
+   my $ll = " " x $flvl;
+   $logger->trace("$ll func start: [$fc]");
+   my $retc=0;
+
+   if ( $bequiet ) {
+      my $command = "xe sr-probe type=lvmohba host-uuid=\$(xe host-list name-label=\$(hostname -s) --minimal)";
+      qx($command);
+   } else {
+      $logger->warn("$ll  please you --do new for nice output list of new attached fibre channel luns");
+   }
+
+   $logger->trace("$ll func end: [$fc] - rc=$retc");
+   $flvl--;
+   return $retc;
+}
+
+sub new_luns {
+   my $fc = ( caller(0) )[ 3 ];
+   $flvl++;
+   my $ll = " " x $flvl;
+   $logger->trace("$ll func start: [$fc]");
+   my $retc=0;
+   my $newcounter=0;
+
+   my $probexml="";
+   $probexml = cmdget("xe sr-probe type=lvmohba host-uuid=\$(xe host-list name-label=\$(hostname -s) --minimal)");
+
+   my $devlist=substr($probexml, index($probexml, '<Devlist>'));
+   
+   my $devref = XMLin($devlist, KeyAttr => { BlockDevice => 'SCSIid' }, ForceArray => [ 'BlockDevice' ]);
+   my %devhash=%$devref;
+                                                
+   my $scsiid_s="";
+   my $vendor_s="";
+   my $serial_s="";
+   
+   foreach my $scsiid ( keys % { $devhash{'BlockDevice'} } ) {
+      $scsiid_s=$scsiid;
+      $scsiid_s =~ s/^\s+//;
+      $scsiid_s =~ s/\s+$//;
+      $scsiid_s =~ s/\n//;
+      
+      $vendor_s=$devhash{'BlockDevice'}{$scsiid}{'vendor'};
+      $vendor_s =~ s/^\s+//;
+      $vendor_s =~ s/\s+$//;
+      $vendor_s =~ s/\n//;
+      
+      $serial_s=$devhash{'BlockDevice'}{$scsiid}{'serial'};
+      $serial_s =~ s/^\s+//;
+      $serial_s =~ s/\s+$//;
+      $serial_s =~ s/\n//;
+
+      if ( $bequiet ) {
+         print "  SCSIid: $scsiid_s / Vendor: $vendor_s / Serial Nr. $serial_s\n";
+      } 
+      $newcounter++;
+      $logger->info("  $newcounter => SCSIid: $scsiid_s / Vendor: $vendor_s / Serial Nr. $serial_s");
+   }
+
+   if ( $newcounter > 0 ) {
+      $logger->info("$ll $newcounter new lun found");
+   } else {
+      $logger->info("$ll no new lun found");
+   }
+
+   $logger->trace("$ll func end: [$fc] - rc=$retc");
+   $flvl--;
+   return ($retc,$newcounter);
+}
+
+sub create_sr {
+   my $fc = ( caller(0) )[ 3 ];
+   $flvl++;
+   my $ll = " " x $flvl;
+   $logger->trace("$ll func start: [$fc]");
+   my $retc=0;
+
+   my $probexml=cmdget("xe sr-probe type=lvmohba host-uuid=\$(xe host-list name-label=\$(hostname -s) --minimal)");
+   my $poolname=cmdget("xe pool-list params=name-label --minimal");
+   $poolname=lc($poolname); 
+   my $srcount=00;
+   
+   my $devlist=substr($probexml, index($probexml, '<Devlist>'));
+   
+   my $devref = XMLin($devlist, KeyAttr => { BlockDevice => 'SCSIid' }, ForceArray => [ 'BlockDevice' ]);
+   my %devhash=%$devref;
+   
+   my $scsiid_s="";
+   my $vendor_s="";
+   my $serial_s="";
+   my $createcounter=0;
+
+   my @uuids_a = split( ",", $uuids );   
+   foreach my $scsiid ( keys % { $devhash{'BlockDevice'} } ) {
+      my $founduuid=0;
+      $logger->trace("$ll   work with found scsiid [$scsiid]");
+      
+      $scsiid_s=$scsiid;
+      $scsiid_s =~ s/^\s+//;
+      $scsiid_s =~ s/\s+$//;
+      $scsiid_s =~ s/\n//;
+
+      if ( $uuids ne "ALL") {
+         $logger->debug("$ll    command line given uuids - not all");
+         foreach my $uuid (@uuids_a) {
+            if ( "$uuid" eq "$scsiid_s" ) {
+               $founduuid=1;
+               last;
+            }
+         }
+      } else {
+         $logger->debug("$ll    use all uuids");
+         $founduuid=1;
+      }
+      
+      unless ( $founduuid ) {
+         $logger->debug("$ll   scsiid [$scsiid] is not given by command line - ignore");
+      } else {
+         $logger->debug("$ll  found uuid [$scsiid] in new list ....");
+      
+         $vendor_s=$devhash{'BlockDevice'}{$scsiid}{'vendor'};
+         $vendor_s =~ s/^\s+//;
+         $vendor_s =~ s/\s+$//;
+         $vendor_s =~ s/\n//;
+         
+         $serial_s=$devhash{'BlockDevice'}{$scsiid}{'serial'};
+         $serial_s =~ s/^\s+//;
+         $serial_s =~ s/\s+$//;
+         $serial_s =~ s/\n//;
+         
+         $logger->info("  found new LUN with SCSIid: $scsiid_s / Vendor: $vendor_s / Serial Nr. $serial_s");
+         
+         my $srcount=1;
+         $srcount = sprintf ("%02d",$srcount);
+         my $fc_name_label="";
+
+         my $srlist=cmdget("xe sr-list type=lvmohba params=name-label --minimal");
+         
+         my @srarray=split(/,/,$srlist);
+         my $no_free_found=1;
+         
+         while ( $no_free_found ) {
+            my $found_sr=0;
+            foreach my $sr ( @srarray ){ 
+               $logger->trace("$ll  sr: $sr ");
+
+               $srcount = sprintf ("%02d",$srcount);
+               $fc_name_label="fc_${poolname}_${srcount}";
+
+               if ( "$sr" eq "${fc_name_label}" ) {
+                  $logger->debug("$ll  found a fc sr with count [$srcount]: $sr");
+                  $found_sr=1;
+               }
+            } 
+            if ( $found_sr ) {
+               $srcount++;                                                                                                                # found sr name, new srcount
+            } else {
+               $no_free_found=0;                                                                                                          # found free sr name with srcount
+            }
+         }
+         
+         $logger->debug("$ll  sr count: $srcount");
+         $logger->info("$ll  sr name: $fc_name_label");
+         
+         $logger->trace("$ll   xe sr-create type=lvmohba name-label=${fc_name_label} shared=true device-config:SCSIid=\"$scsiid_s\"");
+         my $sruuid=cmdget("xe sr-create type=lvmohba name-label=fc_${poolname}_${srcount} shared=true device-config:SCSIid=\"$scsiid_s\"");
+         if ( "$sruuid" ne "" ) {
+            $logger->info("$ll new sr created successfully");
+            $retc = cmdset("xe sr-param-set uuid=$sruuid name-description=\"SR $vendor_s $serial_s\" ");
+            unless ($retc) {
+              $logger->debug("$ll description created");
+              $srcount++;
+              $createcounter++;
+              $srcount = sprintf ("%02d",$srcount);
+            } else {
+               $logger->error("error changing description for $scsiid - abort");
+               $retc=98;
+               last;
+            }
+         } else {
+            $retc=99;
+            $logger->error("cannot create sr for SCSIid=$scsiid - abort");
+            last;
+         }
+      }
+   }
+   
+   if ( $createcounter > 0 ) {
+      $logger->info("$ll $createcounter new lun sr created");
+   } else {
+      $logger->info("$ll no new lun sr created");
+   }
+
+   $logger->trace("$ll func end: [$fc] - rc=$retc");
+   $flvl--;
+   return ($retc,$createcounter);
+}
+
+sub destroy_srs {
+   my $fc = ( caller(0) )[ 3 ];
+   $flvl++;
+   my $ll = " " x $flvl;
+   $logger->trace("$ll func start: [$fc]");
+
+   my $uuids_del=shift();
+   
+   my $retc=0;
+   my @uuids_a;
+
+   unless ( defined $uuids_del ) {
+      $logger->error("no uuids to delete given - abort");
+      $retc=99;
+   }
+   
+   unless ( $retc ) {
+      my $srlist=cmdget("xe sr-list type=lvmohba params=name-label --minimal");
+      if ( "$srlist" ne "" ) {
+         $logger->trace("$ll  found lvmohba lun srs");
+
+         @uuids_a=split(/,/,$uuids_del);
+
+         foreach my $uuid2del ( @uuids_a ){ 
+            my $srname2del=cmdget("xe sr-list uuid=$uuid2del params=name-label --minimal");
+            if ( "$srname2del" eq "" ) {
+               $logger->error("cannot find sr with uuid [$uuid2del] in this pool - abort");
+               $retc=97;
+               last;
+            } else {
+               $logger->info("$ll   found sr [$srname2del] in this pool - delete now ...");
+               $retc=destroy_sr($uuid2del);
+               if ( $retc ) {
+                  $logger->error("cannot delete sr [$srname2del]");
+               }
+            }
+         }
+      } else {
+         $logger->warn("$ll  no lvmohba srs found - can't delete one");
+      }
+   }
+   
+   $logger->trace("$ll func end: [$fc] - rc=$retc");
+   $flvl--;
+   return $retc;
+}
+
+sub destroy_sr {
+   my $fc = ( caller(0) )[ 3 ];
+   $flvl++;
+   my $ll = " " x $flvl;
+   $logger->trace("$ll func start: [$fc]");
+
+   my $uuid2del=shift();
+   
+   my $retc=0;
+
+   unless ( defined $uuid2del ) {
+      $logger->error("no uuid to delete given - abort");
+      $retc=99;
+   }
+   
+   unless ( $retc ) {
+      my $srname=cmdget("xe sr-list uuid=$uuid2del params=name-label --minimal");
+      if ( "$srname" ne "" ) {
+         $logger->trace("$ll  found lvmohba lun srs [$srname]");
+
+         my $pbduuids=cmdget("xe pbd-list sr-uuid=$uuid2del params=uuid --minimal");
+         if ( "$pbduuids" ne "" ) {
+            $logger->info("$ll  unplug pbds now ...");
+            my @pbduuids_a=split(/,/,$pbduuids);
+            foreach my $pbduuid ( @pbduuids_a ){ 
+               $logger->info("$ll   delete pbd [$pbduuid] ...");
+               $retc=cmdset("xe pbd-unplug uuid=$pbduuid");
+               if ( $retc ) {
+                  $logger->error("can't delete pbd with uuid [$pbduuid] - abort");
+                  last;
+               }
+            }
+            
+            unless ( $retc ) {
+               $logger->info("$ll  destroy sr now ...");
+               $retc=cmdset("xe sr-destroy uuid=$uuid2del");
+               if ( $retc ) {
+                  $logger->error("cannot destroy sr with uuid [$uuid2del]");
+               }
+            }
+         } else {
+            $logger->error("cannot find pbd uuids of sr uuid [%uuid2del] - abort");
+            $retc=98;
+         }
+      } else {
+         $logger->error("no lvmohba sr found - can't delete uuid [$uuid2del]");
+         $retc=99;
+      }
+   }
+   
+   $logger->trace("$ll func end: [$fc] - rc=$retc");
+   $flvl--;
+   return $retc;
+}
+
+# main ------------------------------------------------------------------------------------------------------------------------------------
+my $counter = 0;
+my $mode="none";
+if ($#ARGV eq '-1') { help(); }
+
+my @ARGS = @ARGV; 
+my $numargv = @ARGS;
+
+for ($counter = 0; $counter < $numargv; $counter++) {
+    $logger->debug(" Argument: $ARGS[$counter]");
+    if ($ARGS[$counter] =~ /^-h$/i) {                
+       help();
+    }
+    elsif ($ARGS[$counter] eq "") {                  
+        ## Do nothing
+    }
+    elsif ($ARGS[$counter] =~ /^--help/) {           
+       help();
+    }
+    elsif ($ARGS[$counter] =~ /^--quiet/) {           
+       Log::Log4perl->eradicate_appender("Screen");
+       $bequiet=1;
+    }
+    elsif ($ARGS[$counter] =~ /^--do$/) {           
+        $counter++;
+        if ($ARGS[$counter] && $ARGS[$counter] !~ /^-/) {
+            $mode = $ARGS[$counter];
+            chomp($mode);
+            $mode =~ s/\n|\r//g;
+        } else { 
+           $logger->error(" The argument after --do was not correct - ignore!"); 
+           $counter--; 
+        }
+    }
+    elsif ($ARGS[$counter] =~ /^--uuid$/) {           
+        $counter++;
+        if ($ARGS[$counter] && $ARGS[$counter] !~ /^-/) {
+            $uuids = $ARGS[$counter];
+            chomp($uuids);
+            $uuids =~ s/\n|\r//g;
+        } else { 
+           $logger->error(" The argument after --uuid was not correct - ignore!"); 
+           $counter--; 
+        }
+    }
+    else {
+       $logger->warn(" Unknown option [$ARGS[$counter]]- ignore");
+    }
+}
+
+$logger->info("Starting $prg - v.$ver");
+$logger->info(" Mode: $mode");
+
+if ( $mode ne "none") {
+   if ( $mode eq "new" ) {
+      $logger->info(" list probed luns");
+      ($retc, $luncounter) = new_luns();
+   } elsif ( $mode eq "create" ) {
+      $logger->info(" create sr");
+      ($retc, $luncounter) = create_sr();   
+   } elsif ( $mode eq "list" ) {
+      $logger->info(" list existings sr");
+      ($retc, $luncounter) = list_luns(); 
+   } elsif ( $mode eq "print" ) {
+      $logger->info(" print xml info without errors");
+      $retc = print_luns(); 
+   } elsif ( $mode eq "destroy" ) {
+      $logger->info(" destroy given srs ");
+      if ( "$uuids" eq "ALL" ) {
+         $logger->error("destroy sr(s) only with given uuid(s) - abort");
+         $retc=10;
+      } else {
+         $retc = destroy_srs($uuids); 
+      }
+   } else {
+      $logger->error(" unknown mode - abort");
+      $retc=99;
+   }
+} else {
+   $logger->error(" no job to do given on command line - abort");
+   $retc=99;
+}
+
+if ( $retc ) {
+   $logger->error(" something wrong - see log file for more detailed errors");
+} else {
+   $logger->info(" return list,new or created luns [$luncounter]");
+}
+
+$logger->info("End $prg - v.$ver rc=$luncounter");
+exit ($retc);
+
+
+__END__
+
+
+
+
+ 
+

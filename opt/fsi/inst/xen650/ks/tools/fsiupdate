@@ -1,0 +1,1096 @@
+#!/usr/bin/perl -w
+#
+#   update and patching xenserver
+#
+#   This program is free software; you can redistribute it and/or modify it under the
+#   terms of the GNU General Public License as published by the Free Software Foundation;
+#   either version 3 of the License, or (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+#   without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#   See the GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License along with this program;
+#   if not, see <http://www.gnu.org/licenses/>.
+#
+our $ver = "1.2.06 - 17.05.2017";
+my $retc = 0;
+use strict;
+use warnings;
+use FindBin qw($Bin);
+my $fsidir = "/var/fsi";
+use lib "/var/fsi/module";
+use IO::File;
+use UUID::Tiny;
+use Sys::Hostname;
+use File::Copy;
+use File::Path;
+
+open my $file, '<', "/etc/redhat-release"; 
+my $redhatrel = <$file>; 
+close $file;
+my ($xenmain) = $redhatrel =~ /(\d+)/;   
+my $xencfg = "xen$xenmain";
+
+my $conf_file   = "$fsidir/log.cfg";
+my $logfile     = "$fsidir/fsixeninst.log";
+my $visrvfile   = "$fsidir/fsisrv";
+my $vimountfile = "$fsidir/vimount";
+my $confxen     = "$fsidir/$xencfg.conf";
+my %conf;
+$conf{'pool'}    = "none";
+$conf{'xenmp'}   = "none";
+$conf{'fsisrv'}  = "none";
+my $mode         = "none";
+my $xenreboot    = 0;                                                                                                              # automaticaly reboot if needed
+my $hostflag     = 0;                                                                                                              # if call from customize.sh no host flag control
+my $patchfirst   = 0;                                                                                                              # if call from customize.sh and no master, patch first
+my $kspath       = "/mnt/ks";
+my $ksupdcontrol = $kspath . "/upd/update.lst";
+my @updks;                                                                                                                         # fsi deploy server config array (uuid)
+my $poolupdctlfile = "pool.upd";
+my @updpool;                                                                                                                       # pool config hash (patch = uuid)
+my $poolupdcontrol  = "none";
+my $debugcontrol    = "none";
+my $debugctlfile    = "pool.debug";
+my $locupdcontrol   = "$fsidir/$xencfg.upd";
+my $locapplycontrol = "$fsidir/$xencfg.apply";
+my @updloc;                                                                                                                        # local config hash (patch = uuid/rpm)
+my $unmount = 0;
+my $master  = 0;
+our $flvl = 0;                                                                                                                     # function level
+my $pool      = "none";
+my $reboot    = 0;
+my $finish    = 0;                                                                                                                 # patch finish or end
+my $patchneed = 0;                                                                                                                 # need patch to install
+use File::Spec;
+use File::Basename;
+my $rel_path = File::Spec->rel2abs(__FILE__);
+my ( $volume, $dirs, $prg ) = File::Spec->splitpath($rel_path);
+my $prgname = basename( $prg, '.pl' );
+use Log::Log4perl qw(:no_extra_logdie_message);
+
+unless ( -e $conf_file ) {
+   print "\n ERROR: cannot find config file for logs $conf_file !\n\n";
+   exit(101);
+}
+sub get_log_fn { return $logfile }
+Log::Log4perl->init($conf_file);
+our $logger = Log::Log4perl::get_logger();
+$logger->info("Starting $prg - v.$ver");
+
+# functions
+our $frc = 0;                                                                                                                      # global function return code for cmdget
+require "/usr/bin/fsifunc.pl";                                                                                                      # global perl routine
+## For printing colors to the console
+my ${colorRed}    = "\033[31;1m";
+my ${colorGreen}  = "\033[32;1m";
+my ${colorCyan}   = "\033[36;1m";
+my ${colorWhite}  = "\033[37;1m";
+my ${colorNormal} = "\033[m";
+my ${colorBold}   = "\033[1m";
+my ${colorNoBold} = "\033[0m";
+
+sub fsimounted {
+   my $fc = ( caller(0) )[ 3 ];
+   $flvl++;
+   my $ll = " " x $flvl;
+   $logger->trace("$ll func start: [$fc]");
+   my $retc    = 0;
+   my $xenpath = $kspath . "/upd";
+   unless ( -d $xenpath ) {
+      $logger->debug("$ll ks path not exist - must mount before");
+      $retc = 1;
+   }
+   $logger->trace("$ll func end: [$fc] rc: [$retc]");
+   $flvl--;
+   return ($retc);
+} ## end sub fsimounted
+
+sub mountfsisrv {
+   my $fc = ( caller(0) )[ 3 ];
+   $flvl++;
+   my $ll = " " x $flvl;
+   $logger->trace("$ll func start: [$fc]");
+   my $retc = 0;
+   $retc = cmdset("mount -t nfs $conf{'fsisrv'}:$conf{'xenmp'} $kspath");
+   $logger->trace("$ll func end: [$fc] rc: [$retc]");
+   $flvl--;
+   return ($retc);
+} ## end sub mountfsisrv
+
+sub umountfsisrv {
+   my $fc = ( caller(0) )[ 3 ];
+   $flvl++;
+   my $ll = " " x $flvl;
+   $logger->trace("$ll func start: [$fc]");
+   my $retc = 0;
+   $retc = cmdset("umount $kspath");
+   $logger->trace("$ll func end: [$fc] rc: [$retc]");
+   $flvl--;
+   return ($retc);
+} ## end sub umountfsisrv
+
+sub addpatch {
+   my $fc = ( caller(0) )[ 3 ];
+   $flvl++;
+   my $ll = " " x $flvl;
+   $logger->trace("$ll func start: [$fc]");
+   my $retc  = 0;
+   my $patch = shift();
+   my $file  = shift();
+   $logger->info("$ll   $patch installed - update local cfg");
+   my $command = "echo $patch >>$file";
+   $logger->trace("$ll cmd: $command");
+   $retc = cmdset($command);
+
+   if ($retc) {
+      $logger->error("cannot add [$patch] to [$file] - rc=$retc");
+   }
+   $logger->trace("$ll func end: [$fc] rc: [$retc]");
+   $flvl--;
+   return ($retc);
+} ## end sub addpatch
+
+sub patch_apply {
+   my $fc = ( caller(0) )[ 3 ];
+   $flvl++;
+   my $ll = " " x $flvl;
+   $logger->trace("$ll func start: [$fc]");
+   my $retc        = 0;
+   my $masterapply = shift();
+   my $configflag  = "";
+   my $applyflag   = "";
+   unless ( $patchfirst && not $masterapply ) {
+      $logger->debug("$ll normal pool apply");
+      $configflag = $ksupdcontrol;
+      $applyflag  = $poolupdcontrol;
+   } else {
+      $logger->debug("$ll local server apply");
+      $configflag = $poolupdcontrol;
+      $applyflag  = $locapplycontrol;
+   }
+   unless ($patchfirst) {
+      unless ($hostflag) {
+         $logger->info("$ll check if we run alone ...");
+         my @command = ( "fsipoolrun", "check", "sub" );
+         $retc = system(@command);
+         unless ($retc) {
+            $logger->info("$ll  pool block file set");
+         } else {
+            $logger->error("Cannot set pool block file ($retc) - abort $?");
+         }
+      } ## end unless ($hostflag)
+   } else {
+      $logger->info("$ll  local patch - do not check alone flag");
+   }
+   unless ($retc) {
+      $logger->info("$ll  check if upd control file exist");
+      unless ( -e $configflag ) {
+         $logger->warn("$ll  no upd control file exist on fsi deploy server - no patch needed");
+         $finish = 1;
+      }
+   } ## end unless ($retc)
+   unless ( $finish && $retc ) {
+      $logger->info("$ll  read upd control file");
+      my $input = IO::File->new("< $configflag") or $retc=66;
+      unless ( $retc ) {
+         my $line;
+         while ( defined( $line = $input->getline() ) ) {
+            chomp($line);                                                                                                             # no newline
+            $line =~ s/#.*//;                                                                                                         # no comments
+            $line =~ s/^\s+//;
+            $line =~ s/\s+$//;
+            next unless length($line);                                                                                                # no was da ?
+            $line =~ s/^\"//;
+            $line =~ s/"$//;
+            @updks = ( @updks, $line );
+            $logger->trace("$ll  patch: $line add to control array");
+         } ## end while ( defined( $line = $input->getline() ) )
+         $input->close();
+         $logger->trace("$ll  some patches found or not ?");
+         my $anzahlpatches = @updks;
+         unless ($anzahlpatches) {
+            $logger->warn("$ll  no patches found in $ksupdcontrol - end");
+            $finish = 1;
+         } else {
+            $logger->debug("$ll  found $anzahlpatches patches");
+         }
+      } else {
+         $logger->debug("cannot read $configflag: $!");
+         $logger->info("$ll  cannot read $configflag - $! - ignore");         
+         $retc=0;
+      }
+         
+   } ## end unless ( $finish && $retc )
+   unless ( $finish && $retc ) {
+      $logger->info("$ll  check if pool upd control file exist");
+      unless ( -e $applyflag ) {
+         $logger->warn("$ll  no upd control file exist in pool - use empty hash");
+      } else {
+         $logger->info("$ll  read pool upd control file");
+         my $input = IO::File->new("< $applyflag") or $logger->logdie("cannot read $applyflag: $!");
+         my $line;
+         while ( defined( $line = $input->getline() ) ) {
+            chomp($line);                                                                                                          # no newline
+            $line =~ s/#.*//;                                                                                                      # no comments
+            $line =~ s/^\s+//;
+            $line =~ s/\s+$//;
+            next unless length($line);                                                                                             # no was da ?
+            $line =~ s/^\"//;
+            $line =~ s/"$//;
+            @updpool = ( @updpool, $line );
+            $logger->trace("$ll  patch: $line");
+         } ## end while ( defined( $line = $input->getline() ) )
+         $input->close();
+      } ## end else
+   } ## end unless ( $finish && $retc )
+   unless ( $finish && $retc ) {
+      $logger->info("$ll  start compare control files");
+      my $patch;
+      foreach $patch (@updks) {
+         $logger->debug("$ll   ==> patch: $patch already installed ?");
+         my $instpatch;
+         foreach $instpatch (@updpool) {
+            $logger->trace("$ll       compare with [$instpatch]");
+            my $comp_instpatch=$instpatch;
+            my $comp_patch=$patch;
+            $comp_instpatch =~ s/^[!_](.*)/$1/g;
+            $comp_patch =~ s/^[!_](.*)/$1/g;
+            $logger->trace("$ll       compare [$comp_instpatch]/[$comp_patch]");
+            if ( $comp_instpatch eq $comp_patch ) {
+               $logger->trace("$ll    ==> already uploaded");
+               $patch = "uploaded";
+               last;
+            }
+         } ## end foreach $instpatch (@updpool)
+         $logger->trace("$ll    patch status: $patch");
+         unless ( $patch eq "uploaded" ) {
+            $logger->debug("$ll    ==> must uploaded");
+         }
+      } ## end foreach $patch (@updks)
+      foreach $patch (@updks) {
+         my $command;
+         if ( $patch ne "uploaded" ) {
+            $logger->info("$ll  Upload patch: $patch now");
+            if ( $mode eq "inst" ) {
+               my ($ext) = $patch =~ /(\.[^.]+)$/;
+               if ( $ext eq ".rpm" ) {
+                  $logger->info("$ll   => RPM Update found");
+                  $logger->info("$ll   Only pool update config must update");
+                  $command = "echo $patch >>$applyflag";
+                  $logger->trace("$ll cmd: $command");
+                  $retc = cmdset($command);
+                  if ($retc) {
+                     $logger->error("cannot add patch to pool config");
+                     $retc = 99;
+                  }
+               } elsif ( $ext eq ".tgz" ) {
+                  $logger->info("$ll   => TGZ Update found");
+                  $logger->info("$ll   Only pool update config must update");
+                  $command = "echo $patch >>$applyflag";
+                  $logger->trace("$ll cmd: $command");
+                  $retc = cmdset($command);
+                  if ($retc) {
+                     $logger->error("cannot add patch to pool config");
+                     $retc = 99;
+                  }
+               } elsif ( $ext eq ".xsupdate" ) {
+                  $logger->info("$ll   => XS Update found - upload now ...");
+                  $logger->debug("$ll   start upload to pool");
+                  $logger->trace("$ll   look for ! not to reboot ...");
+                  my $tmppatch;
+                  if ( ( substr( $patch, 0, 1 ) eq "!" ) || ( substr( $patch, 0, 1 ) eq "_" ) ) {
+                     $tmppatch = $kspath . "/upd/" . substr( $patch, 1, length($patch) - 1 );
+                  } else {
+                     $tmppatch = $kspath . "/upd/" . $patch;
+                  }
+                  $command = "xe patch-upload file-name=$tmppatch";
+                  $logger->trace("$ll   cmd: $command");
+                  my $patchuuid = cmdget($command);
+                  if ( is_UUID_string($patchuuid) ) {
+                     $logger->info("$ll   Upload $patch ok");
+                     $logger->trace("$ll    uuid ok: $patchuuid");
+                     $logger->info("$ll   Add patch to pool config");
+                     $command = "echo $patch >>$applyflag";
+                     $logger->trace("$ll  cmd: $command");
+                     $retc = cmdset($command);
+                     if ($retc) {
+                        $logger->error("cannot add patch to pool config");
+                        $retc = 99;
+                        last;
+                     }
+                  } else {
+                     $logger->error("Patchupload $patch failed - abort");
+                     $retc = 55;
+                     last;
+                  }
+               } elsif ( $ext eq ".iso" ) {
+                  $logger->info("$ll   => ISO Update found - upload now ...");
+                  $logger->debug("$ll   start upload to pool");
+                  $logger->trace("$ll   look for ! not to reboot ...");
+                  my $tmppatch;
+                  if ( ( substr( $patch, 0, 1 ) eq "!" ) || ( substr( $patch, 0, 1 ) eq "_" ) ) {
+                     $tmppatch = $kspath . "/upd/" . substr( $patch, 1, length($patch) - 1 );
+                  } else {
+                     $tmppatch = $kspath . "/upd/" . $patch;
+                  }
+                  $command = "xe update-upload file-name=$tmppatch";
+                  $logger->trace("$ll   cmd: $command");
+                  my $patchuuid = cmdget($command);
+                  if ( is_UUID_string($patchuuid) ) {
+                     $logger->info("$ll   Upload $patch ok");
+                     $logger->trace("$ll    uuid ok: $patchuuid");
+                     $logger->info("$ll   Add patch to pool config");
+                     $command = "echo $patch >>$applyflag";
+                     $logger->trace("$ll  cmd: $command");
+                     $retc = cmdset($command);
+                     if ($retc) {
+                        $logger->error("cannot add patch to pool config");
+                        $retc = 99;
+                        last;
+                     }
+                  } else {
+                     $logger->error("Patchupload $patch failed - abort");
+                     $retc = 55;
+                     last;
+                  }
+               } else {
+                  $logger->warn("$ll  Unknown patch extentions -ignore");
+               }
+            } else {
+               $logger->info("$ll   ==> checkmode: $patch need upload");
+            }
+         } ## end if ( $patch ne "uploaded" )
+      } ## end foreach $patch (@updks)
+   } ## end unless ( $finish && $retc )
+   $logger->trace("$ll func end: [$fc] rc: [$retc]");
+   $flvl--;
+   return ($retc);
+} ## end sub patch_apply
+
+sub delete_path {
+   my $fc = ( caller(0) )[ 3 ];
+   $flvl++;
+   my $ll   = " " x $flvl;
+   my $retc = 0;
+   $logger->trace("$ll func start: [$fc]");
+   my $path = shift();
+   if ( -d $path ) {
+      $logger->debug("$ll path [$path] exist - delete");
+      eval { rmtree($path) };
+      if (@$) {
+         $logger->error("problem deleting $path");
+         $retc = 98;
+      } else {
+         $logger->debug("$ll path deleted sucessful");
+      }
+   } else {
+      $logger->debug("$ll path does not exist");
+   }
+   $logger->trace("$ll func end: [$fc] rc: [$retc]");
+   $flvl--;
+   return ($retc);
+} ## end sub delete_path
+
+sub create_path {
+   my $fc = ( caller(0) )[ 3 ];
+   $flvl++;
+   my $ll   = " " x $flvl;
+   my $retc = 0;
+   $logger->trace("$ll func start: [$fc]");
+   my $path = shift();
+   unless ( -d $path ) {
+      $logger->debug("$ll path [$path] does not exist - create");
+      eval { mkpath($path) };
+      if ($@) {
+         $logger->error("problem creating $path");
+         $retc = 99;
+      } else {
+         $logger->debug("$ll path created sucessful");
+      }
+   } else {
+      $logger->debug("$ll path already created");
+   }
+   $logger->trace("$ll func end: [$fc] rc: [$retc]");
+   $flvl--;
+   return ($retc);
+} ## end sub create_path
+
+sub patch_inst {
+   my $fc = ( caller(0) )[ 3 ];
+   $flvl++;
+   my $ll = " " x $flvl;
+   $logger->trace("$ll func start: [$fc]");
+   my $retc = 0;
+   my $command;
+   my $masterapply = shift();
+   my $configflag  = "";
+   my $host = hostname();
+   unless ( $patchfirst && not $masterapply ) {
+      $logger->debug("$ll normal pool apply");
+      $configflag = $poolupdcontrol;
+   } else {
+      $logger->debug("$ll local server apply");
+      $configflag = $locapplycontrol;
+   }
+   unless ($master) {
+      unless ($patchfirst) {
+         unless ($hostflag) {
+            $logger->info("$ll check if we run alone ...");
+            my @command = ( "fsipoolrun", "check", "sub" );
+            $retc = system(@command);
+            if ( $retc == 0 ) {
+               $logger->info("$ll  pool block file set");
+            } else {
+               $logger->error("Cannot set pool block file ($retc) - abort $?");
+            }
+         } ## end unless ($hostflag)
+      } else {
+         $logger->info("$ll  stand alone or server without pool - ignore check");
+      }
+   } ## end unless ($master)
+   unless ($retc) {
+      unless ( -e $configflag ) {
+         $logger->info("$ll  no upd control file exist in pool - no updates");
+         $finish = 1;
+      } else {
+         $logger->debug("$ll   empty pool update hash");
+         @updpool = ();
+         $logger->info("$ll  read pool upd control file");
+         my $input = IO::File->new("< $configflag") or $logger->logdie("cannot read $configflag: $!");
+         my $line;
+         while ( defined( $line = $input->getline() ) ) {
+            chomp($line);                                                                                                          # no newline
+            $line =~ s/#.*//;                                                                                                      # no comments
+            $line =~ s/^\s+//;
+            $line =~ s/\s+$//;
+            next unless length($line);                                                                                             # no was da ?
+            $line =~ s/^\"//;
+            $line =~ s/"$//;
+            @updpool = ( @updpool, $line );
+            $logger->trace("$ll    patch: $line");
+         } ## end while ( defined( $line = $input->getline() ) )
+         $input->close();
+      } ## end else
+   } ## end unless ($retc)
+   unless ( $finish && $retc ) {
+      unless ( -e $locupdcontrol ) {
+         $logger->info("$ll  no local upd control file exist");
+      } else {
+         $logger->info("$ll  read local upd control file");
+         my $input = IO::File->new("< $locupdcontrol") or $logger->logdie("cannot read $locupdcontrol: $!");
+         my $line;
+         while ( defined( $line = $input->getline() ) ) {
+            chomp($line);                                                                                                          # no newline
+            $line =~ s/#.*//;                                                                                                      # no comments
+            $line =~ s/^\s+//;
+            $line =~ s/\s+$//;
+            next unless length($line);                                                                                             # no was da ?
+            $line =~ s/^\"//;
+            $line =~ s/"$//;
+            @updloc = ( @updloc, $line );
+            $logger->trace("$ll  patch: $line");
+         } ## end while ( defined( $line = $input->getline() ) )
+         $input->close();
+      } ## end else
+   } ## end unless ( $finish && $retc )
+   unless ( $finish && $retc ) {
+      $logger->info("$ll   check for new patches to install on this xen server");
+      my $patch;
+      $patchneed = 0;
+      foreach $patch (@updpool) {
+         $logger->debug("$ll   ==> patch: $patch is already installed ?");
+         my $instpatch;
+         foreach $instpatch (@updloc) {
+            $logger->trace("$ll       compare with [$instpatch]");
+            my $comp_instpatch=$instpatch;
+            my $comp_patch=$patch;
+            $comp_instpatch =~ s/^[!_](.*)/$1/g;
+            $comp_patch =~ s/^[!_](.*)/$1/g;
+            $logger->trace("$ll       compare [$comp_instpatch]/[$comp_patch]");
+            if ( $comp_instpatch eq $comp_patch ) {
+               $logger->debug("$ll    ==> already installed");
+               $patch = "installed";
+               last;
+            }
+         } ## end foreach $instpatch (@updloc)
+         $logger->trace("$ll    patch status: $patch");
+         unless ( $patch eq "installed" ) {
+            $logger->debug("$ll    ==> must install");
+            $patchneed = 1;
+         }
+      } ## end foreach $patch (@updpool)
+   } ## end unless ( $finish && $retc )
+   if ($patchneed) {
+      $logger->info("$ll   one or more patch to install found");
+      unless ($patchfirst) {
+         unless ($retc) {
+            if ( $mode eq "inst" ) {
+               $logger->info("$ll  set HA off in pool");
+               my @command = ( "fsichha", "-d", "-s", "2" );
+               $retc = system(@command);
+               if ( $retc == 0 ) {
+                  $logger->info("$ll  HA off");
+               } else {
+                  $logger->error("Cannot stop ha ($retc) - abort $?");
+               }
+            } ## end if ( $mode eq "inst" )
+         } ## end unless ($retc)
+      } else {
+         $logger->debug("$ll standalone or server without pool need no deactivate ha");
+      }
+      unless ($retc) {
+         my $patch;
+         foreach $patch (@updpool) {
+            $logger->trace("$ll   patch: $patch");
+            unless ( ( $patch eq "installed" ) || ($retc) ) {
+               $logger->info("$ll    ==> $patch must install");
+               if ( $mode eq "inst" ) {
+                  my ($ext) = $patch =~ /(\.[^.]+)$/;
+                  if ( $ext eq ".rpm" ) {
+                     $logger->info("$ll   => RPM Update found - install now ...");
+                     $logger->debug("$ll   install $patch now ...");
+                     my $tmppatch;
+                     my $tmppatchname;
+                     if ( ( substr( $patch, 0, 1 ) eq "!" ) || ( substr( $patch, 0, 1 ) eq "_" ) ) {
+                        $tmppatchname = substr( $patch, 1, length($patch) - 1 );
+                     } else {
+                        $tmppatchname = $patch;
+                     }
+                     $logger->trace("$ll   Patch: $tmppatchname");
+                     $tmppatch = $kspath . "/upd/" . $tmppatchname;
+                     
+                     my $testcmd        = "rpm -q --quiet $tmppatchname";
+                     my $eo             = qx($testcmd  2>&1);
+                     my $patchinstalled = $?;
+                     $patchinstalled = $patchinstalled >> 8 unless ( $patchinstalled == -1 );
+                     my $command;
+
+                     if ($patchinstalled) {
+                        $logger->debug("$ll    Patch $tmppatchname is installed - update ...");
+                        $command = "rpm -U $tmppatch";
+                     } else {
+                        $logger->debug("$ll    Patch $tmppatchname is not installed - fresh install ...");
+                        $command = "rpm -i $tmppatch";
+                     }
+                     
+                     
+                     $retc = cmdset($command);
+                     if ($retc) {
+                        $logger->error("cannot install patch");
+                        $retc = 99;
+                     }
+                     
+                     unless ($retc) {
+                        $retc = addpatch( $patch, $locupdcontrol );
+                        if ($retc) { last; }
+                     }
+                  } elsif ( $ext eq ".xsupdate" ) {
+                     $logger->info("$ll   => XS Update found - install now ...");
+                     $logger->debug("$ll   install $patch now");
+                     unless ($retc) {
+                        my $tmppatch;
+                        my $patchlabel;
+                        if ( ( substr( $patch, 0, 1 ) eq "!" ) || ( substr( $patch, 0, 1 ) eq "_" ) ) {
+                           $tmppatch = $kspath . "/upd/" . substr( $patch, 1, length($patch) - 1 );
+                           $patchlabel = substr( $patch, 1, length($patch) - 1 );
+                        } else {
+                           $tmppatch   = $kspath . "/upd/" . $patch;
+                           $patchlabel = $patch;
+                        }
+                        $patchlabel =~ s{\.[^.]+$}{};
+                        $logger->debug("$ll   get uuid from patch $patchlabel");
+                        my $command   = "xe patch-list name-label=$patchlabel --minimal";
+                        my $patchuuid = cmdget($command);
+                        if ( is_UUID_string($patchuuid) ) {
+                           my $command = "xe patch-precheck uuid=$patchuuid host-uuid=$conf{'HOSTuuid'}";
+                           $logger->trace("$ll cmd: $command");
+                           $retc = cmdset($command);
+                           if ($retc) {
+                              $logger->error("cannot precheck patch on this xen server");
+                              $retc = 99;
+                              last;
+                           }
+                           unless ($retc) {
+                              $logger->trace("$ll   patch uuid: $patchuuid");
+                              my $command = "xe patch-apply uuid=$patchuuid host-uuid=$conf{'HOSTuuid'}";
+                              $logger->trace("$ll cmd: $command");
+                              $retc = cmdset($command);
+                              if ($retc) {
+                                 $logger->error("cannot install patch on this xen server");
+                                 $retc = 99;
+                                 last;
+                              }
+                           } ## end unless ($retc)
+                        } else {
+                           $logger->error("something wrong with patch uuid");
+                           $retc   = 99;
+                           $finish = 1;
+                           last;
+                        } ## end else [ if ( is_UUID_string($patchuuid) ) ]
+                     } ## end unless ($retc)
+                     unless ($retc) {
+                        $retc = addpatch( $patch, $locupdcontrol );
+                        if ($retc) { last; }
+                     }
+                  } elsif ( $ext eq ".iso" ) {
+                     $logger->info("$ll   => ISO Update found - install now ...");
+                     $logger->debug("$ll   install $patch now");
+                     unless ($retc) {
+                        my $tmppatch;
+                        my $patchlabel;
+                        if ( ( substr( $patch, 0, 1 ) eq "!" ) || ( substr( $patch, 0, 1 ) eq "_" ) ) {
+                           $tmppatch = $kspath . "/upd/" . substr( $patch, 1, length($patch) - 1 );
+                           $patchlabel = substr( $patch, 1, length($patch) - 1 );
+                        } else {
+                           $tmppatch   = $kspath . "/upd/" . $patch;
+                           $patchlabel = $patch;
+                        }
+                        $patchlabel =~ s{\.[^.]+$}{};
+                        $logger->debug("$ll   get uuid from patch $patchlabel");
+                        my $command   = "xe update-list name-label=$patchlabel --minimal";
+                        my $patchuuid = cmdget($command);
+                        if ( is_UUID_string($patchuuid) ) {
+                           my $command = "xe update-precheck uuid=$patchuuid host=$host";
+                           $logger->trace("$ll cmd: $command");
+                           $retc = cmdset($command);
+                           if ($retc) {
+                              $logger->error("cannot precheck patch on this xen server");
+                              $retc = 99;
+                              last;
+                           }
+                           unless ($retc) {
+                              $logger->trace("$ll   patch uuid: $patchuuid");
+                              my $command = "xe update-apply uuid=$patchuuid  host=$host";
+                              $logger->trace("$ll cmd: $command");
+                              $retc = cmdset($command);
+                              if ($retc) {
+                                 $logger->error("cannot install patch on this xen server");
+                                 $retc = 99;
+                                 last;
+                              }
+                           } ## end unless ($retc)
+                        } else {
+                           $logger->error("something wrong with patch uuid");
+                           $retc   = 99;
+                           $finish = 1;
+                           last;
+                        } ## end else [ if ( is_UUID_string($patchuuid) ) ]
+                     } ## end unless ($retc)
+                     unless ($retc) {
+                        $retc = addpatch( $patch, $locupdcontrol );
+                        if ($retc) { last; }
+                     }
+                  } elsif ( $ext eq ".tgz" ) {
+                     $logger->info("$ll   => tgz Update found - install now ...");
+                     my $patchdir;
+                     my $tmppatch;
+                     if ( ( substr( $patch, 0, 1 ) eq "!" ) || ( substr( $patch, 0, 1 ) eq "_" ) ) {
+                        $patchdir = "/tmp/patch-" . substr( $patch, 1, length($patch) - 1 );
+                        $tmppatch = substr( $patch, 1, length($patch) - 1 );
+                     } else {
+                        $patchdir = "/tmp/patch-$patch";
+                        $tmppatch = $patch;
+                     }
+                     $logger->trace("$ll   patch dir: $patchdir");
+                     $retc = create_path($patchdir);
+                     my $command = "tar -xzf $kspath/upd/$tmppatch -C $patchdir";
+                     $retc = cmdset($command);
+                     if ($retc) {
+                        $logger->error("cannot unpack patch");
+                        $retc = 99;
+                        last;
+                     }
+                     my $filename;
+                     $logger->info("$ll   search for install routine");
+                     foreach $filename ( glob("$patchdir/*.sh") ) {
+                        $filename = basename($filename);
+                        $logger->trace("$ll   found script file: $filename");
+                        $logger->trace("$ll   change in patch dir");
+                        unless ( chdir($patchdir) ) {
+                           $logger->error("cannot change to patch dir");
+                           $retc = 99;
+                        }
+                        unless ($retc) {
+                           if ( $filename eq "install.sh" ) {
+                              $logger->debug("$ll  chmod installation file $filename");
+                              my $command = "chmod 0777 $filename";
+                              $retc = cmdset($command);
+                              if ($retc) {
+                                 $logger->error("cannot chmod install script");
+                              } else {
+                                 $logger->info("$ll  run patch installation now");
+                                 my @command = ("./$filename");
+                                 $retc = system(@command);
+                                 unless ($retc) {
+                                    $logger->trace("$ll   ok");
+                                    $logger->trace("$ll   rc=$retc");
+                                 } else {
+                                    $logger->error("rc=$retc");
+                                    $logger->error("cannot install patch $patch - abort");
+                                 }
+                              } ## end else [ if ($retc) ]
+                              last;
+                           } elsif ( $filename eq "setup.sh" ) {
+                              $logger->debug("$ll  chmod installation file $filename");
+                              my $command = "chmod 0777 $filename";
+                              $retc = cmdset($command);
+                              if ($retc) {
+                                 $logger->error("cannot chmod install script");
+                              } else {
+                                 my $command = "./$filename";
+                                 $logger->trace("$ll   cmd: [$command]");
+                                 my $eo = qx($command  2>&1);
+                                 $retc = $?;
+                                 $retc = $retc >> 8 unless ( $retc == -1 );
+                                 unless ($retc) {
+                                    $logger->trace("$ll   ok");
+                                    $logger->trace("$ll   [$eo]");
+                                 } else {
+                                    $logger->error("ERROR [$eo]");
+                                    $logger->error("cannot install patch $patch - abort");
+                                 }
+                              } ## end else [ if ($retc) ]
+                              last;
+                           } else {
+                              $logger->warn("$ll   unknown install [$filename] - ignore");
+                           }
+                        } ## end unless ($retc)
+                     } ## end foreach $filename ( glob("$patchdir/*.sh") )
+                     unless ($retc) {
+                        $logger->debug("$ll  change to root dir");
+                        unless ( chdir("/") ) {
+                           $logger->error("cannot change to root dir");
+                           $retc = 99;
+                        }
+                     } ## end unless ($retc)
+                     unless ($retc) {
+                        $logger->debug("$ll   remove install dir [$patchdir]");
+                        $retc = delete_path($patchdir);
+                        if ($retc) {
+                           $logger->error("cannot remove temp patch dir - abort");
+                           last;
+                        }
+                     } ## end unless ($retc)
+                     unless ($retc) {
+                        $retc = addpatch( $patch, $locupdcontrol );
+                        if ($retc) { last; }
+                     }
+                  } else {
+                     $logger->warn("$ll  Unknown patch extensions - ignore");
+                  }
+                  unless ($retc) {
+                     if ( ( substr( $patch, 0, 1 ) eq "!" ) || ( substr( $patch, 0, 1 ) eq "_" ) ) {
+                        $logger->debug("$ll do not reboot after this patch - go on");
+                        if ( substr( $patch, 0, 1 ) eq "_" ) {
+                           $logger->info("$ll  test if xapi online");
+                           $retc = stackon();
+                           unless ($retc) {
+                              $logger->info("$ll  xapi stack online");
+                              $logger->info("$ll  call toolstack restart");
+                              $retc = cmdset('/opt/xensource/bin/xe-toolstack-restart');
+                              if ($retc) {
+                                 $logger->error("cannot restart toolstack rc=$retc");
+                                 $finish = 1;
+                                 last;
+                              } else {
+                                 $logger->info("$ll  ok - go on");
+                              }
+                           } ## end unless ($retc)
+                           unless ($retc) {
+                              $logger->debug("$ll  test if toolstack online");
+                              $retc = stackon();
+                           }
+                        } ## end if ( substr( $patch, 0, 1 ) eq "_" )
+                     } else {
+                        $logger->info("$ll   patch install successful - reboot now ...");
+                        $reboot = 1;
+                        $finish = 1;
+                        last;
+                     } ## end else [ if ( ( substr( $patch, 0, 1 ) eq "!" ) || ( substr( $patch, 0, 1 ) eq "_" ) ) ]
+                  } ## end unless ($retc)
+               } else {
+                  $logger->info("$ll  checkmode: $patch not install now");
+               }
+            } else {
+               $logger->debug("$ll    ==> $patch is already installed");
+            }
+         } ## end foreach $patch (@updpool)
+      } ## end unless ($retc)
+      unless ($retc) {
+         unless ($patchfirst) {                                                                                                    # no pool at this moment
+            if ( $mode eq "inst" ) {
+               $logger->info("$ll  set HA on in pool");
+               my @command = ( "fsichha", "-a", "-s", "2" );
+               $retc = system(@command);
+               $retc = $retc >> 8 unless ( $retc == -1 );
+               if ( $retc == 0 ) {
+                  $logger->info("$ll  HA on");
+               } elsif ( $retc == 2 ) {
+                  $logger->warn("$ll  no ha config found - ignore");
+                  $retc=0;  
+               } elsif ( $retc == 3 ) {
+                  $logger->warn("$ll  not enough xenserver in pool - cannot enable ha");
+                  $retc=0;  
+               } elsif ( $retc == 4 ) {
+                  $logger->warn("$ll  ha is disabled by fsi portal - ignore");
+                  $retc=0;  
+               } else {
+                  $logger->error("Cannot start ha ($retc) - abort $?");
+               }
+            } else {
+               $logger->info("only in inst mode we change ha settings in pool");
+            }
+         } else {
+            $logger->info("$ll  server patching before join pool - no enable ha");
+         }
+      } ## end unless ($retc)
+   } else {
+      $logger->info("$ll  ==> all patches installed");
+   }
+   unless ($retc) {
+      unless ($patchfirst) {
+         unless ($hostflag) {
+            $logger->info("$ll  remove block file");
+            my @command = ( "fsipoolrun", "remove", "sub" );
+            $retc = system(@command);
+            if ( $retc == 0 ) {
+               $logger->info("$ll  pool block file removed");
+            } else {
+               $logger->error("Cannot remove pool block file ($retc) - abort $?");
+            }
+         } ## end unless ($hostflag)
+      } else {
+         $logger->info("$ll  server patching before join pool - no block file");
+      }
+   } ## end unless ($retc)
+   $logger->trace("$ll func end: [$fc] rc: [$retc]");
+   $flvl--;
+   return ($retc);
+} ## end sub patch_inst
+
+sub iammaster {
+   my $fc = ( caller(0) )[ 3 ];
+   $flvl++;
+   my $ll = " " x $flvl;
+   $logger->trace("$ll func start: [$fc]");
+   my $retc = 0;
+   if ( $conf{'insttyp'} eq "standalone" ) {
+      $logger->trace("$ll   => standalone config - no master");
+   } else {
+      $logger->trace("$ll   master/member config, try to detect");
+      my $command = "fsimaster name";
+      $logger->trace("$ll   cmd: $command");
+      my $vimaster = cmdget($command);
+      $logger->debug("$ll   xen master: $vimaster");
+      my $host = hostname();
+      $logger->debug("$ll   xen host: $host");
+      if ( $host eq $vimaster ) {
+         $logger->debug("$ll  I am master");
+         $retc = 1;
+      } else {
+         $logger->debug("$ll  I am member");
+      }
+   } ## end else [ if ( $conf{'insttyp'} eq "standalone" ) ]
+   $logger->trace("$ll func end: [$fc] rc: [$retc]");
+   $flvl--;
+   return ($retc);
+} ## end sub iammaster
+
+sub help {
+   print <<EOM;
+
+             ${colorBold}$prg - $ver : H E L P${colorNoBold}
+
+  ${colorGreen}Update XenServer with Fixes and Updates${colorNormal}
+  
+    ${colorRed}Misc${colorNormal}
+    --help             this help site
+    --sub              call as subroutine in installation part
+    --first            during first installation without pool membership
+    --reboot           reboot xenserver after installation
+    
+    ${colorRed}Mode${colorNormal}
+    --mode check       check if new patches ready to install
+    --mode inst        install new patches
+
+EOM
+   exit(0);
+} ## end sub help
+
+# main ------------------------------------------------------------------------------------------------------------------------------------
+my $counter = 0;
+if ( $#ARGV eq '-1' ) { help() }
+my @ARGS    = @ARGV;
+my $numargv = @ARGS;
+for ( $counter = 0 ; $counter < $numargv ; $counter++ ) {
+   $logger->debug(" Argument: $ARGS[$counter]");
+   if ( $ARGS[ $counter ] =~ /^-h$/i ) {
+      help();
+      exit(0);
+   } elsif ( $ARGS[ $counter ] eq "" ) {
+      ## Do nothing
+   } elsif ( $ARGS[ $counter ] =~ /^--help/ ) {
+      help();
+      exit(0);
+   } elsif ( $ARGS[ $counter ] =~ /^--sub/ ) {
+      $hostflag = 1;
+      $flvl = 4;
+   } elsif ( $ARGS[ $counter ] =~ /^--first/ ) {
+      $patchfirst = 1;
+   } elsif ( $ARGS[ $counter ] =~ /^--reboot/ ) {
+      $xenreboot = 1;
+   } elsif ( $ARGS[ $counter ] =~ /^--mode$/ ) {
+      $counter++;
+      if ( $ARGS[ $counter ] && $ARGS[ $counter ] !~ /^-/ ) {
+         $mode = $ARGS[ $counter ];
+         chomp($mode);
+         $mode =~ s/\n|\r//g;
+      } else {
+         $logger->error("The argument after --mode was not correct - ignore!");
+         $counter--;
+      }
+   } else {
+      $logger->warn(" Unknown option [$ARGS[$counter]]- ignore");
+   }
+} ## end for ( $counter = 0 ; $counter < $numargv ; $counter++ )
+if ( $mode eq "none" ) {
+   help();
+   exit(0);
+}
+unless ( ( $mode eq "check" ) || ( $mode eq "inst" ) ) {
+   print("\nWrong mode parameter !\n\n");
+   help();
+   exit(0);
+}
+$logger->info(" Mode: $mode");
+if ($hostflag) {
+   $logger->info(" sub routine mode");
+}
+unless ($retc) {
+   $logger->debug(" read conf ...");
+   $retc=read_config($confxen,\%conf);
+}
+unless ($retc) {
+   $logger->debug(" check vars from conf");
+   if ( $conf{'pool'} eq "none" ) {
+      $logger->info("no pool name define - standalone mode");
+      $logger->debug("  xen update file = ks update file");
+      $poolupdcontrol = $ksupdcontrol;
+      $logger->debug("   loc upd ctr: $poolupdcontrol");
+      $debugcontrol = $kspath . "/upd/" . $debugctlfile;
+      $logger->trace("   debug file: $debugcontrol");
+   } else {
+      $logger->debug("  xen pool: $conf{'pool'}");
+      $poolupdcontrol = $kspath . "/pool/" . $conf{'pool'} . "/" . $poolupdctlfile;
+      $logger->debug("   pool ctr: $poolupdcontrol");
+      $debugcontrol = $kspath . "/pool/" . $conf{'pool'} . "/" . $debugctlfile;
+      $logger->trace("   debug file: $debugcontrol");
+   } ## end else [ if ( $conf{'pool'} eq "none" ) ]
+} ## end unless ($retc)
+unless ($retc) {
+   if ( $conf{'xenmp'} eq "none" ) {
+      $logger->error("cannot get xen mount path - abort");
+      $retc = 99;
+   } else {
+
+      # $logger->debug("  cat mount path subdir ks ...");
+      # $conf{'xenmp'} =~ s/\/ks$//;
+      $logger->debug("  xen mount path: $conf{'xenmp'}");
+   } ## end else [ if ( $conf{'xenmp'} eq "none" ) ]
+} ## end unless ($retc)
+unless ($retc) {
+   if ( $conf{'fsisrv'} eq "none" ) {
+      $logger->error("cannot get fsi deploy server - abort");
+      $retc = 99;
+   } else {
+      $logger->debug("  fsi deploy server: $conf{'fsisrv'}");
+   }
+} ## end unless ($retc)
+unless ($retc) {
+   $logger->debug(" test if fsi deploy server mounted ...");
+   $unmount = fsimounted();
+   $logger->trace(" unmount flag: $unmount");
+   if ($unmount) {
+      $logger->info(" try to mount fsi deploy server");
+      $retc = mountfsisrv();
+   } else {
+      $logger->info(" fsi deploy server is already mounted");
+   }
+} ## end unless ($retc)
+unless ($retc) {
+   $logger->info(" check if I am a master ...");
+   $master = iammaster();
+   if ($master) {
+      $logger->info(" I am a master server - apply patches to pool first");
+      $retc = patch_apply($master);
+   } else {
+      $logger->info(" I am a member server");
+      if ($patchfirst) {
+         $logger->info(" I am a member server in NO pool - patch first");
+         $retc = patch_apply($master);
+      } else {
+         $logger->info(" I am a member server in a pool - no patch apply needed!");
+      }
+   } ## end else [ if ($master) ]
+} ## end unless ($retc)
+unless ($retc) {
+   unless ($finish) {
+      $logger->info(" install xen patches ...");
+      $retc = patch_inst($master);
+   }
+} ## end unless ($retc)
+unless ($retc) {
+   my $host = hostname();
+   $logger->debug("  copy log file to fsi server");
+   $logger->info("  $prgname ended with rc=$retc");
+   my $rc = copy( $logfile, $kspath . "/log/" . $host . ".log" );
+   unless ($rc) {
+      $logger->error("cannot copy logfile to fsi deploy server [$!] ");
+      $retc = 99;
+   }
+} ## end unless ($retc)
+unless ($retc) {
+   if ($unmount) {
+      $logger->info(" unmount fsi deploy server now");
+      $retc = umountfsisrv();
+   } else {
+      $logger->info(" no unmount, mount still needed");
+   }
+} ## end unless ($retc)
+if ( $retc eq 0 ) {
+   if ( $reboot eq 1 ) {
+      my $host = hostname();
+      $logger->info(" a new patch is installed - need reboot");
+      $retc = 1;
+      if ($xenreboot) {
+         $logger->info(" disable xenserver [$host] now");
+         my $disablecmd = "xe host-disable host=$host";
+         my $rec        = cmdset($disablecmd);
+         if ($rec) {
+            $logger->error("cannot disable xenserver - abort reboot");
+         } else {
+            $logger->info(" reboot xenserver [$host] now");
+            my $rcmd = "xe host-reboot host=$host";
+            $rec = cmdset($rcmd);
+            if ($rec) {
+               $logger->error("cannot reboot xenserver - abort");
+            } else {
+               $logger->info(" reboot now ...");
+            }
+         } ## end else [ if ($rec) ]
+      } else {
+         $logger->trace(" no auto reboot");
+      }
+   } else {
+      $logger->info(" all patches installed - end $prgname");
+   }
+} else {
+   $logger->error("something wrong - see log file for more detailed errors");
+}
+$logger->debug("retc= $retc");
+$logger->info("End $prg - v.$ver - rc $retc");
+exit($retc);
+__END__
+

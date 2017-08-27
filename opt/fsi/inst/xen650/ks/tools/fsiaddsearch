@@ -1,0 +1,89 @@
+#!/bin/sh
+#
+#   viaddsearch.sh - add search string im member installation
+#
+#   Attention: this is a bug fix or patch, during join xen pool the dns search is not set
+#              on the member server
+#
+#   This program is free software; you can redistribute it and/or modify it under the 
+#   terms of the GNU General Public License as published by the Free Software Foundation;
+#   either version 3 of the License, or (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; 
+#   without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. 
+#   See the GNU General Public License for more details.
+#  
+#   You should have received a copy of the GNU General Public License along with this program; 
+#   if not, see <http://www.gnu.org/licenses/>.
+#
+ver="1.0.2 - 10.10.2013"
+retc=0
+ls="  "
+progname=${0##*/}
+SOURCE="${BASH_SOURCE[0]}"
+DIR="$( dirname "$SOURCE" )"
+while [ -h "$SOURCE" ]; do 
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+  DIR="$( cd -P "$( dirname "$SOURCE"  )" && pwd )"
+done
+export progdir="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
+if [ -z $fsifunc ]; then export fsifunc="/usr/bin/fsifunc.sh"; fi
+if [ -f $fsifunc ]; then
+   . $fsifunc
+   . $fsivars
+else
+   echo "ERROR cannot load fsi functions $fsifunc"
+   exit 99
+fi
+if [ -z $logfile ]; then logfile=$fsidir"/"$progname".log"; fi
+
+
+# main ------------------------------------------------------------------------------------------------------------------------------------
+
+if [ "$2" == "sub" ] ; then
+  ls="     "
+  tracemsg "$ls Parameter sub detected v.$ver"
+fi
+infmsg "$ls patch dns search"
+
+dnssearch="$1"
+if [ -z $dnssearch ]; then
+   errmsg "no dnssearch parameter set"
+   retc=99
+else
+   debmsg "$ls  dns search: $dnssearch"
+fi
+
+if [ $retc -eq 0 ]; then
+   infmsg "$ls   set dns search in resolv.conf"
+   echo search $dnssearch >>/etc/resolv.conf
+   retc=$?
+   if [ $retc -eq 0 ]; then
+     infmsg "$ls   added"
+   else
+     errmsg "cannot add dnssearch to resolv.conf"
+     retc=99
+   fi
+   resolv_file=$(cat /etc/resolv.conf)
+   tracemsg "$ls  resolv:[$resolv_file]"
+fi
+
+if [ $retc -eq 0 ]; then
+   infmsg "$ls   set dns search xenserver api"
+   
+   uuid=$(xe pif-list host-name-label=$HOSTNAME network-name-label=Management --minimal)
+   tracemsg "$ls   uuid: $uuid"
+
+   xe pif-param-set uuid=$uuid other-config:domain=$dnssearch
+   if [ $retc -eq 0 ]; then
+     infmsg "$ls   added to mgmt net"
+   else
+     errmsg "cannot add dnssearch to xe object of mgmt net"
+     retc=99
+   fi
+fi
+
+infmsg "$ls End routine rc=$retc"
+exit $retc
+

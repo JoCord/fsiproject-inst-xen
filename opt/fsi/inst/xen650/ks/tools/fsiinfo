@@ -1,0 +1,319 @@
+#!/bin/sh
+#
+#   get xen infos an generate info files for fsi
+#
+#   This program is free software; you can redistribute it and/or modify it under the 
+#   terms of the GNU General Public License as published by the Free Software Foundation;
+#   either version 3 of the License, or (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; 
+#   without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. 
+#   See the GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License along with this program; 
+#   if not, see <http://www.gnu.org/licenses/>.
+#
+mounted=0
+quietmode=""
+go=1
+
+ver="1.0.19 - 27.6.2017"
+retc=0
+ls="  "
+progname=${0##*/}
+SOURCE="${BASH_SOURCE[0]}"
+DIR="$( dirname "$SOURCE" )"
+while [ -h "$SOURCE" ]; do 
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+  DIR="$( cd -P "$( dirname "$SOURCE"  )" && pwd )"
+done
+export progdir="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
+if [ -z $fsifunc ]; then export fsifunc="/usr/bin/fsifunc.sh"; fi
+if [ -f $fsifunc ]; then
+   . $fsifunc
+   . $fsivars
+else
+   echo "ERROR cannot load fsi functions $fsifunc"
+   exit 99
+fi
+logfile=$fsidir"/"$progname".log";
+
+   
+help() {
+   echo
+   echo " Help for $progname - $ver"    
+   echo
+   echo " create info files for fsi"
+   echo
+   echo "  Parameter:"
+   echo "   -n                 generate new info files"
+   echo
+   echo "  Optional Parameter:"
+   echo "   -q                 quiet mode"
+   echo "   -0                 info mode"
+   echo "   -1                 debug mode"
+   echo "   -2                 trace mode"
+   echo "   -l <logfile>       other logfile"
+   echo
+   echo "  Return Code:"
+   echo "    1 = help"
+   echo "    2 = no pool "
+   echo "    > = different meaning"
+   echo
+   echo "  Example:"
+   echo "    $progname -n"
+   echo
+}
+
+
+while getopts ":nl:hq012" optname; do
+   #tracemsg "Option $optname has value $OPTARG"
+   case "$optname" in
+      "h")
+         help
+         exit 1
+        ;;
+      "q")
+         export deb2scr="no"
+         quietmode=" -q "
+         debmsg " quiet mode"
+        ;;
+      "0")
+         export deb2scr="yes"
+         export debug="info"
+         quietmode=" -0 "
+         debmsg " info mode"
+        ;;
+      "1")
+         export deb2scr="yes"
+         export debug="debug"
+         quietmode=" -1 "
+         debmsg " debug mode"
+        ;;
+      "2")
+         export deb2scr="yes"
+         export debug="trace"
+         quietmode=" -2 "
+         debmsg " trace mode"
+        ;;
+      "l")
+         export logfile="$OPTARG"
+         debmsg " log: $logfile"
+        ;;
+      "n")
+         go=0
+        ;;
+      "?")
+        errmsg "Unknown option $OPTARG"
+        ;;
+      ":")
+        errmsg "No argument value for option $OPTARG"
+        ;;
+      *)
+      # Should not occur
+        errmsg "Unknown error while processing options"
+        ;;
+   esac
+done
+
+if [ $go -eq 1 ] ; then
+   help
+   exit 1
+fi
+
+infmsg "$ls Start $progname $ver"
+
+tracemsg "$ls  check if deploy server already mounted"
+
+if [ $retc -eq 0 ]; then
+   /usr/bin/fsimount -c
+   retc=$?
+   if [ $retc -eq 0 ]; then
+      tracemsg "$ls  deploy server mount point found"
+   elif [ $retc -eq 1 ]; then
+      debmsg "$ls  deploy server not mounted - try to mount"
+      mounted=1
+      /usr/bin/fsimount -m
+      retc=$?
+   else
+      errmsg "cannot check deploy server mountpoint"
+   fi
+fi   
+
+
+if [ $retc -eq 0 ]; then
+   tracemsg "$ls    ==> fsi deploy server: $fsisrv"
+   tracemsg "$ls    ==> fsi deploy temp mount: $xenmp"
+   tracemsg "$ls    ==> ks mount point: $kspath"
+   tracemsg "$ls    ==> pool: $pool"
+
+   viinfopath=$kspath/pool/$pool/info
+   srvlogpath=$kspath/log
+   
+   tracemsg "$ls    ==> info path: $viinfopath"
+   tracemsg "$ls    ==> log path: $srvlogpath"
+   
+   if [ ! -d $viinfopath ]; then
+      debmsg "$ls  no $viinfopath exist - create it"
+      mkdir $viinfopath > /dev/null 2>&1
+      retc=$?
+      if [ $retc -ne 0 ]; then
+         errmsg "cannot create info dir in pool dir [$viinfopath]"
+      fi
+   fi
+   
+fi
+
+if [ $retc -eq 0 ]; then
+   srvinstlog="$srvlogpath/"${HOSTNAME%%.*}".log"
+   tracemsg "$ls  server logfile: $srvinstlog"
+fi
+
+if [ $retc -eq 0 ]; then
+   srvinfopath="$viinfopath/"${HOSTNAME%%.*}
+   tracemsg "$ls  server info path: $srvinfopath"
+   
+   if [ -d $srvinfopath ]; then
+      debmsg "$ls  old info path exist - delete it"
+      rm -Rf $srvinfopath/* > /dev/null 2>&1
+      retc=$?
+      if [ $retc -ne 0 ]; then
+         errmsg "cannot delete content of $srvinfopath"
+      else
+         rmdir $srvinfopath  > /dev/null 2>&1
+         if [ $retc -ne 0 ]; then
+            errmsg "cannot delete content of $srvinfopath"
+         fi
+      fi
+   fi
+fi
+
+if [ $retc -eq 0 ]; then
+   if [ ! -d $srvinfopath ]; then
+      debmsg "$ls  create $srvinfopath ..."
+      mkdir $srvinfopath > /dev/null 2>&1
+      retc=$?
+      if [ $retc -ne 0 ]; then
+         errmsg "cannot create server info dir in log dir [$srvinfopath]"
+      fi
+   fi
+fi
+
+if [ $retc -eq 0 ]; then
+   tracemsg "$ls  start creating information files on fsi server"
+
+
+   debmsg "$ls   get nic firmware info"
+   printf "%-10s %-10s %-20s %-20s \n" "nic" "driver" "driver version" "firmware" >$srvinfopath/nicsdetail
+   for i in $(xe pif-list host-name-label=${HOSTNAME%%.*} physical=true params=device --minimal | tr "," "\n" | sort ); do 
+      debmsg "$ls    get nic $i info"
+      vmnicdetail=$(ethtool -i $i)
+      tracemsg "$ls   $vmnicdetail"
+      # tracemsg "$ls   nic: $i"
+      driver=$(echo $vmnicdetail | sed -e 's/^.*driver: \([^ ,]*\).*$/\1/')
+      # tracemsg "$ls   driver: $driver"
+      driverver=$(echo $vmnicdetail | sed -e 's/^.* version: \([^ ,]*\).*$/\1/')
+      # tracemsg "$ls   driver version $driverver"
+      firmware=$(echo $vmnicdetail | sed -e 's/^.*firmware-version: \([^,]*\).*bus-info:.*$/\1/')
+      #tracemsg "$ls   firmware: $firmware"      
+      printf "%-10s %-10s %-20s %-20s \n" $i "$driver" "$driverver" "$firmware" >>$srvinfopath/nicsdetail
+      # tracemsg "$ls   $i $driver $driverver $firmware"
+   done 
+      
+   debmsg "$ls   get uptime"
+   uptime >$srvinfopath/uptime
+
+   debmsg "$ls   get vmware version info"
+   cat /etc/redhat-release -v >$srvinfopath/version
+
+   debmsg "$ls   get ntp info"
+   cat /etc/ntp.conf >$srvinfopath/ntp
+   
+   debmsg "$ls   get disk free info"
+   df -h -t ext3 >$srvinfopath/dfext
+   
+   prozent=$(df -h -t ext3 | awk '/sda1/ {print $5}')
+   prozent=${prozent//\%}
+   echo "[% dp = $prozent %]" >$srvinfopath/dfprozent
+
+   df -h -t nfs >>$srvinfopath/dfnfs
+   
+   debmsg "$ls   get date info"
+   date >$srvinfopath/testtime
+   
+   debmsg "$ls   get service config status ($xenmain)"
+   if [ "$xenmain" == "7" ]; then
+      systemctl list-unit-files >$srvinfopath/serviceconf
+   else
+      chkconfig --list >$srvinfopath/serviceconf
+   fi
+   
+   xpconf="/etc/xensource/pool.conf"
+   if [ -f $xpconf ]; then
+      debmsg "$ls   get pool server conf from file $xpconf"
+      cat $xpconf >$srvinfopath/xenpoolconf
+   else
+      warnmsg "$ls   no $xpconf found"
+   fi
+   netconf="/etc/xensource/network.conf"
+   if [ -f $xpconf ]; then
+      debmsg "$ls   get network conf from file $netconf"
+      cat $netconf >$srvinfopath/networkconf
+   else
+      warnmsg "$ls   no $netconf found"
+   fi
+   
+   debmsg "$ls   last shutdown and reboots"
+   last -i -d -w -x -R reboot shutdown | head -n -2 >$srvinfopath/boot
+
+   debmsg "$ls   get resolv.conf"
+   cat /etc/resolv.conf >$srvinfopath/resolv
+
+   debmsg "$ls   get xen dns conf"
+   echo $(fsichdns -q -p) >$srvinfopath/dns
+
+   debmsg "$ls   get syslog destination"
+   echo $(xe host-param-get param-name=logging param-key=syslog_destination uuid=$(xe host-list name-label=$(hostname -s) --minimal) ) >$srvinfopath/syslogdest
+   
+   debmsg "$ls   get syslog.conf"
+   cat /etc/syslog.conf >$srvinfopath/syslog
+
+   debmsg "$ls   get sar files"
+   cp -f /var/log/sa/* >$srvinfopath/
+
+   debmsg "$ls   get authorized_keys"
+   akeys="/root/.ssh/authorized_keys"
+   if [ -f $akeys ]; then
+      debmsg "$ls   get $akeys"
+      cat $akeys >$srvinfopath/ssh_authorized_keys
+   else
+      warnmsg "$ls   no $akeys found"
+   fi
+   debmsg "$ls   get known_hosts"
+   khosts="/root/.ssh/known_hosts"
+   if [ -f $khosts ]; then
+      debmsg "$ls   get $khosts"
+      cat $khosts >$srvinfopath/ssh_known_hosts
+   else
+      warnmsg "$ls   no $khosts found"
+   fi
+  
+   debmsg "$ls   get fsixeninst.log"
+   cat /var/fsi/fsixeninst.log >$srvinstlog
+     
+fi
+  
+
+if [ $mounted -eq 1 ]; then
+   infmsg "$ls  fsi deploy server was not mounted at start - unmount now"
+   /usr/bin/fsimount -u
+   retc=$?
+else
+   debmsg "$ls  fsi deploy server was mounted at start - leave it"
+fi
+  
+infmsg "$ls End $progname $ver - rc=$retc"
+exit $retc
+   
+

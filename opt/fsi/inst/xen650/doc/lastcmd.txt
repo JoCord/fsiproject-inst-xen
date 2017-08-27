@@ -1,0 +1,12 @@
+
+Folgende Dateien werden zum Schluss gesucht und ausgeführt:
+
+   "$kspath/sub/sub-98_lastcmd.sh"
+   "$kspath/pool/$pool/pool.sh"
+   "/root/xen6.sh"
+
+Ausserdem wird gecheckt ob das
+
+$kspath/post
+
+Directory existiert -  wenn ja werden dort alle "last_*.sh" Dateien ausgeführt ... wieder so mit 01, 02 etc. nacheinander.

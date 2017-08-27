@@ -1,0 +1,19 @@
+#!/bin/bash
+
+touch /etc/boottime.stamp
+
+/sbin/update-issue
+clear </dev/tty1 >/dev/tty1
+
+defconsole="$(sed -ne 's/.*\(console=[^ ]*\).*/\1/p' /proc/cmdline)"
+defconsole=${defconsole#console=}
+
+if [ ! -e /etc/xensource/no_move_kernel_tty ]
+then
+    if [ "x${defconsole}" = "x" ] || [[ ${defconsole} = tty[0-9]* ]]
+    then
+        # Put the kernel messages on tty2
+        /usr/bin/openvt -c 2 /bin/echo "System Messages:"
+        /opt/xensource/libexec/set-printk-console 2
+    fi
+fi

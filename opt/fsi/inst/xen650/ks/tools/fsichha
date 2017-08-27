@@ -1,0 +1,509 @@
+#!/bin/sh
+#
+#   change and check ha
+#
+#   This program is free software; you can redistribute it and/or modify it under the 
+#   terms of the GNU General Public License as published by the Free Software Foundation;
+#   either version 3 of the License, or (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; 
+#   without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. 
+#   See the GNU General Public License for more details.
+#  
+#   You should have received a copy of the GNU General Public License along with this program; 
+#   if not, see <http://www.gnu.org/licenses/>.
+#
+pool="none"
+insttyp="none"
+timeout=30
+hasr="none"
+MHF="none"
+haon=1
+haoff=1
+hacheck=1
+masterip="none"
+flag_poolmhf="none"
+flag_pool="none"
+fsimounted=0
+
+ver="1.0.6 - 16.05.2017"
+retc=0
+ls="  "
+progname=${0##*/}
+SOURCE="${BASH_SOURCE[0]}"
+DIR="$( dirname "$SOURCE" )"
+while [ -h "$SOURCE" ]; do 
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+  DIR="$( cd -P "$( dirname "$SOURCE"  )" && pwd )"
+done
+export progdir="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
+if [ -z $fsifunc ]; then export fsifunc="/usr/bin/fsifunc.sh"; fi
+if [ -f $fsifunc ]; then
+   . $fsifunc
+   . $fsivars
+else
+   echo "ERROR cannot load fsi functions $fsifunc"
+   exit 99
+fi
+if [ -z $logfile ]; then logfile=$fsidir"/"$progname".log"; fi
+
+
+help() {
+   echo
+   echo " Help for $progname - $ver"    
+   echo
+   echo " check and change xen pool ha "
+   echo
+   echo "  Parameter:"
+   echo "   -a                 activate and configure ha in pool"
+   echo "   -d                 deactivate or disable ha in pool"
+   echo "   -c                 check ha status 0 = on, 1 = off"
+   echo
+   echo "  Optional Parameter:"
+   echo "   -s <level>         sub level"
+   echo "   -q                 quiet mode"
+   echo "   -0                 info mode"
+   echo "   -1                 debug mode"
+   echo "   -2                 trace mode"
+   echo "   -l <logfile>       other logfile"
+   echo
+   echo "  Return Code:"
+   echo "    1 = help"
+   echo "    2 = no ha config found"
+   echo "    3 = not enough xenserver in pool to activate ha (MHF)"
+   echo "    4 = ha disable flag found"
+   echo "    > = different meaning"
+   echo
+   echo "  Example:"
+   echo "    $progname -c"
+   echo "    $progname -a"
+   echo
+}
+
+
+function ha_enable() {
+   local retc=0
+   tracemsg "$ls  Function [$FUNCNAME] startet"
+   ls="$ls  "
+   local POOLUUID=""
+   local hastat=99
+   local hasruuid=""
+   local haabort=30
+   local xensrv=0
+
+   if [ "$insttyp" == "master" ] || [ "$insttyp" == "member" ]; then
+      if [ "$flag_poolmhf" == "none" ]; then
+         errmsg "cannot find pool mhf config file entry"   
+         retc=98
+      else
+      
+         if [ $retc -eq 0 ]; then
+            /usr/bin/fsimount -c
+            retc=$?
+            if [ $retc -eq 0 ]; then
+               tracemsg "$ls  deploy server mount point found"
+            elif [ $retc -eq 1 ]; then
+               debmsg "$ls  deploy server not mounted - try to mount"
+               fsimounted=1
+               /usr/bin/fsimount -m
+               retc=$?
+               if [ $retc -ne 0 ]; then
+                  errmsg "cannot mount deploy server - abort"
+                  retc=88
+               fi
+            else
+               errmsg "cannot check deploy server mountpoint"
+            fi
+         fi   
+      
+         debmsg "$ls  detect ${flag_poolmhf} ..."
+         if [ -f $flag_poolmhf ]; then
+            infmsg "$ls  pool mhf config found"
+            MHF=$(cat $flag_poolmhf)
+         else
+            debmsg "$ls  is HA disable by fsi portal?"
+            if [ -f "${flag_poolmhf}_disabled" ]; then
+               warnmsg "$ls  HA enabling is disabled with flag file"
+               retc=4
+            else
+               warnmsg "$ls  no pool mhf found - do not enable HA !"
+               retc=2
+            fi
+         fi
+      fi
+   elif [ "$insttyp" == "standalone" ]; then
+      infmsg "$ls  standalone xenserver cannot configure HA"
+   else 
+      errmsg "unknown insttyp [$insttyp] - abort"
+      retc=99
+   fi
+
+   if [ $retc -eq 0 ]; then
+      tracemsg "$ls  ha sr [$hasr] / MHF: [$MHF]"
+      if [ "$hasr" == "none" ] || [ "$MHF" == "none" ]; then
+         infmsg "$ls  no ha config found - no enable need"
+         tracemsg "$ls  look in storage config if realy enable"
+         retc=2
+      else
+         infmsg "$ls  ha sr found [$hasr] - can I enable ha"
+         infmsg "$ls  how many xen server in pool exist ?"
+         xensrv=$($xecommand host-list --minimal |sed 's/\,/\n/g' |wc -l)
+         debmsg "$ls  xen server count: $xensrv"
+         xensrv=$((xensrv+1))
+         debmsg "$ls  how much xen server we need: $MHF"
+         if [ $xensrv -le $MHF ]; then
+            warnmsg "$ls  to less xen server in pool - do not configure HA - ignore"
+            retc=3
+         else
+            infmsg "$ls  enough xen server in pool - configure HA ..."
+         fi
+      fi
+   fi
+   
+   if [ $retc -eq 0 ]; then
+      infmsg "$ls  read pool uuid"
+      POOLUUID=$(2>&1 $xecommand pool-list --minimal)
+      debmsg "$ls    ==> pool uuid: [$POOLUUID]"
+      if [ "$POOLUUID" == "" ]; then
+         errmsg "cannot get pool uuid"
+         retc=33
+      else
+         tracemsg "$ls  pool uuid found"
+      fi    
+   fi
+   
+   if [ $retc -eq 0 ]; then    
+      infmsg "$ls  get ha status ..."
+      ha_check
+      hastat=$?
+   fi
+
+   if [ $retc -eq 0 ]; then    
+     infmsg "$ls  get hash for pool ha sr [$hasr] ..."
+     tracemsg "$ls   set var to zero"
+     tracemsg "$ls  start get hasru uuid ..."
+     tracemsg "$ls    haabort: $haabort"
+     local hacount=0
+     while [ "$hasruuid" == "" ]; do
+         tracemsg "$ls    hacount: $hacount"
+         hasruuid=$(2>&1 $xecommand sr-list name-label=$hasr --minimal)
+         tracemsg "$ls    ==> sr ha uuid: [$hasruuid]"
+         if [ $hacount -le $haabort ]; then
+             infmsg "$ls    wait a few seconds ..."
+             sleep $timeout
+             hacount=$((hacount+1))
+             tracemsg "$ls    hacount: $hacount"
+             debmsg "$ls    next try .."
+         else
+             errmsg "to much retries - abort"
+             retc=33
+             break
+         fi
+     done
+     tracemsg "$ls    end get hasru uuid while loop"
+   fi
+   
+   if [ $retc -eq 0 ]; then    
+     debmsg "$ls    ==> sr ha uuid: [$hasruuid]"
+     if [ "$hasruuid" != "" ]; then
+         infmsg "$ls   sr ha uuid [$hasruuid] found"
+     else
+         errmsg "cannot find hash for pool ha sr"
+         retc=33
+     fi
+   fi
+
+   if [ $retc -eq 0 ]; then    
+      if [ $hastat -eq 0 ]; then
+         infmsg "$ls  ha already enabled"
+      elif [ $hastat -eq 1 ]; then
+         infmsg "$ls  ha disabled - start configure and enabling"
+
+         tracemsg "$ls    haabort: $haabort"
+         local hacount=0
+         local HAStatus="false"
+         
+         while [ "$HAStatus" == "false" ]; do
+             tracemsg "$ls    hacount: $hacount"    
+             if [ $hacount -le $haabort ]; then
+                 hacount=$((hacount+1))
+                 debmsg "$ls   next try .."
+             else
+                 warnmsg "$ls   to much retries - ignore"
+                 retc=33
+                 break
+             fi
+             debmsg "$ls   cmd: $xecommand pool-ha-enable heartbeat-sr-uuids=$hasruuid"
+             infmsg "$ls   try enable ha  ..."
+             OUTPUT=$(2>&1 $xecommand pool-ha-enable heartbeat-sr-uuids=$hasruuid)
+             retc=$?
+             if [ $retc -ne 0 ]; then
+                 warnmsg "$ls   cannot send enable ha command [$OUTPUT] - wait a few seconds"
+                 sleep $timeout
+             else
+                 infmsg "$ls   command successful - wait ..."
+                 sleep $timeout
+                 infmsg "$ls   get ha status ..."
+                 HAStatus=$($xecommand pool-param-get  uuid=$($xecommand pool-list --minimal)  param-name=ha-enabled)
+                 infmsg "$ls   status: $HAStatus"
+             fi 
+         done # while [ "$HAStatus" == "false" ]
+
+         if [ $retc -eq 0 ]; then
+            infmsg "$ls   HA enabled - wait for replication"
+            sleep 20
+         fi
+         
+         if [ "$HAStatus" == "true"  ]; then
+            infmsg "$ls  ha is enabled now"
+   
+            OUTPUT=$(2>&1 $xecommand pool-param-set ha-host-failures-to-tolerate=$MHF uuid=$($xecommand pool-list --minimal))
+            retc=$?
+            if [ $retc -ne 0 ]; then
+                errmsg "cannot set hmf [$OUTPUT] - abort"
+                retc=66
+            else
+                infmsg "$ls    set hmf"
+            fi
+         elif [ "$HAStatus" == "false"  ]; then
+            errmsg "ha still disabled - something going wrong rc=$retc"
+         else
+             warnmsg "$ls unknown status [$HAStatus] - ignore"
+         fi
+      else
+          errmsg "unknown or error during checking ha status - abort"
+          retc=77
+      fi
+   fi
+   
+   if [ $fsimounted -eq 1 ]; then
+      infmsg "$ls  fsi deploy server was not mounted at start - unmount now"
+      /usr/bin/fsimount -u
+      retc=$?
+   else
+      debmsg "$ls  fsi deploy server was mounted at start - leave it"
+   fi
+
+   
+   ls=${ls:0:${#ls}-2}
+   tracemsg "$ls  Function [$FUNCNAME] ended - rc=$retc"
+   return $retc
+}
+
+function ha_disable() {
+   local retc=0
+   tracemsg "$ls  Function [$FUNCNAME] startet"
+   ls="$ls  "
+   local hastat=99
+   local haabort=30
+   
+   ha_check
+   hastat=$?
+   
+   if [ $hastat -eq 1 ]; then
+      infmsg "$ls  ha already disabled"
+   elif [ $hastat -eq 0 ]; then
+      infmsg "$ls  ha enabled - start disabling ..."                  
+      local HAStatus="true"
+      local hacount=0
+      
+      while [ "$HAStatus" == "true" ]; do
+          if [ $hacount -le $haabort ]; then
+              hacount=$((hacount+1))
+              debmsg "$ls   next try .."
+          else
+              warnmsg "$ls   to much retries - ignore"
+              retc=33
+              break
+          fi
+          OUTPUT=$(2>&1 $xecommand pool-ha-disable)
+          retc=$?
+          if [ $? -ne 0 ]; then
+              errmsg "cannot disable ha command [$OUTPUT] - abort"
+              retc=66
+          else
+              infmsg "$ls  command successful - wait ..."
+              sleep $timeout
+              infmsg "$ls  get ha status ..."
+              HAStatus=$(2>&1 $xecommand pool-param-get  uuid=$($xecommand pool-list --minimal)  param-name=ha-enabled)
+              infmsg "$ls  status: $HAStatus"
+          fi 
+      done
+      if [ "$HAStatus" == "false"  ]; then
+          infmsg "$ls  ha is disable now"
+          retc=0
+      elif [ "$HAStatus" == "true"  ]; then
+         errmsg "$ls  ha still enabled"
+         retc=99
+      else
+          errmsg "unknown status [$HAStatus] - abort"
+          retc=77
+      fi
+  else
+      errmsg "unknown status ha status - abort"
+      retc=77
+  fi
+
+   ls=${ls:0:${#ls}-2}
+   tracemsg "$ls  Function [$FUNCNAME] ended - rc=$retc"
+   return $retc
+}
+
+function ha_check() {
+   local retc=0
+   tracemsg "$ls  Function [$FUNCNAME] startet"
+   ls="$ls  "
+    
+   local cmd="$xecommand pool-param-get uuid=\$($xecommand pool-list --minimal) param-name=ha-enabled"
+   tracemsg "$ls cmd=$cmd"
+   
+   local hastat=$(2>&1 $xecommand pool-param-get uuid=$($xecommand pool-list --minimal) param-name=ha-enabled)
+   tracemsg "$ls  ha status [$hastat]"
+   if [ "$hastat" == "true" ]; then
+      infmsg "$ls ha enabled"
+   elif [ "$hastat" == "false" ]; then
+      infmsg "$ls ha disabled"
+      retc=1
+   else
+      errmsg "unknown status [$hastat]"
+      retc=99
+   fi   
+
+   ls=${ls:0:${#ls}-2}
+   tracemsg "$ls  Function [$FUNCNAME] ended - rc=$retc"
+   return $retc
+}
+
+while getopts ":adcs:l:hq012" optname; do
+   #tracemsg "Option $optname has value $OPTARG"
+   case "$optname" in
+      "h")
+         help
+         exit 1
+        ;;
+      "q")
+         export deb2scr="no"
+         quietmode=" -q "
+         tracemsg " quiet mode"
+        ;;
+      "0")
+         export deb2scr="yes"
+         export debug="info"
+         quietmode=" -0 "
+         tracemsg " info mode"
+        ;;
+      "1")
+         export deb2scr="yes"
+         export debug="debug"
+         quietmode=" -1 "
+         debmsg " debug mode"
+        ;;
+      "2")
+         export deb2scr="yes"
+         export debug="trace"
+         quietmode=" -2 "
+         tracemsg " trace mode"
+        ;;
+      "l")
+         export logfile="$OPTARG"
+         tracemsg " log: $logfile"
+        ;;
+      "s")
+         ls="    "
+        ;;
+      "a")
+         haon=0
+        ;;
+      "d")
+         haoff=0
+        ;;
+      "c")
+         hacheck=0
+        ;;
+      "?")
+        errmsg "Unknown option $OPTARG"
+        ;;
+      ":")
+        errmsg "No argument value for option $OPTARG"
+        ;;
+      *)
+      # Should not occur
+        errmsg "Unknown error while processing options"
+        ;;
+   esac
+done
+
+if [ $haon -eq 1 ] && [ $haoff -eq 1 ] && [ $hacheck -eq 1 ]; then
+   help
+   exit 1
+fi   
+
+infmsg "${ls}Change HA v.$ver"
+
+if [ "$insttyp" == "master" ]; then
+   infmsg "$ls  call command local"
+   xecommand="xe"
+elif [ "$insttyp" == "member" ] || [ "$insttyp" == "standalone" ]; then
+   if [ -z $masterip ] || [ "$masterip" = "none" ]; then
+      infmsg "$ls  master ip not set - try to detect ip ..."
+      master=$(2>&1 /usr/bin/fsimaster name)
+      retc=$?
+      if [ $retc -ne 0 ]; then
+         errmsg "cannot detect master - abort"
+         retc=66
+      else
+         infmsg "$ls  master: $master"
+         debmsg "$ls  dns domain: $dnsdom"
+         if [ -z $dnsdom ]; then
+              dnsmaster=$master
+         else
+              dnsmaster=$master"."$dnsdom
+         fi
+         masterip=$(2>&1 /usr/bin/fsimaster ip $dnsmaster)
+         retc=$?
+         if [ $retc -ne 0 ]; then
+              errmsg "cannot detect master ip - abort"
+              retc=67
+         else
+              infmsg "$ls  master ip: $masterip"
+         fi
+      fi
+   fi                  
+   if [[ ! $masterip =~ $regex_ip ]]; then
+      warnmsg "$ls master ip: $masterip   ==> is not a valid IP address"
+   else
+      debmsg "$ls    ==> pool master: $master"
+      debmsg "$ls    ==> pool master ip: $masterip"
+      infmsg "$ls  master ip: $masterip"
+      xecommand="ssh $g_ssh_options "$poolu"@"$masterip" xe"
+   fi
+else
+    infmsg "$ls  unknown insttyp [$insttyp] - abort"
+    retc=99
+fi 
+     
+if [ $retc -eq 0 ]; then
+   if [ $haon -eq 0 ]; then
+      infmsg "$ls  activate/enable ha"
+      ha_enable
+      retc=$?   
+   elif [ $haoff -eq 0 ]; then
+      infmsg "$ls  deactivate/disable ha"
+      ha_disable
+      retc=$?   
+   elif [ $hacheck -eq 0 ]; then
+      infmsg "$ls  check ha status"
+      ha_check
+      retc=$?   
+   else
+      errmsg "something wrong"
+      retc=99
+   fi
+fi
+
+infmsg "$ls End routine rc=$retc"
+exit $retc
+
+
+

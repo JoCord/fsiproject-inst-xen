@@ -1,0 +1,330 @@
+#!/bin/sh
+#
+#   create xenserver vm harddisk usage report
+#
+#   This program is free software; you can redistribute it and/or modify it under the 
+#   terms of the GNU General Public License as published by the Free Software Foundation;
+#   either version 3 of the License, or (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; 
+#   without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. 
+#   See the GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License along with this program; 
+#   if not, see <http://www.gnu.org/licenses/>.
+#
+mounted=0
+quietmode=""
+rep_sr=1
+rep_vm=1
+rep_file="none"
+rep_nohead=1
+
+ver="1.0.01 - 16.1.2017"
+retc=0
+ls="  "
+progname=${0##*/}
+SOURCE="${BASH_SOURCE[0]}"
+DIR="$( dirname "$SOURCE" )"
+while [ -h "$SOURCE" ]; do 
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+  DIR="$( cd -P "$( dirname "$SOURCE"  )" && pwd )"
+done
+export progdir="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
+if [ -z $fsifunc ]; then export fsifunc="/usr/bin/fsifunc.sh"; fi
+if [ -f $fsifunc ]; then
+   . $fsifunc
+   . $fsivars
+else
+   echo "ERROR cannot load fsi functions $fsifunc"
+   exit 99
+fi
+logfile=$fsidir"/"$progname".log";
+
+   
+help() {
+   echo
+   echo " Help for $progname - $ver"    
+   echo
+   echo " create info files for fsi"
+   echo
+   echo "  Parameter:"
+   echo "   -s                 generate sr report"
+   echo "   -v                 generate vm report"
+   echo "   -r                 write report (to default file)"
+   echo "   -o <filename>      write report to file (without extension)"
+   echo "   -n                 no header in report file"
+   echo
+   echo "  Optional Parameter:"
+   echo "   -q                 quiet mode"
+   echo "   -0                 info mode"
+   echo "   -1                 debug mode"
+   echo "   -2                 trace mode"
+   echo "   -l <logfile>       other logfile"
+   echo
+   echo "  Return Code:"
+   echo "    1 = help"
+   echo "    2 = missing argument "
+   echo "    > = different meaning"
+   echo
+   echo "  Example:"
+   echo "    $progname -n"
+   echo
+}
+
+
+while getopts ":svl:rno:hq012" optname; do
+   #tracemsg "Option $optname has value $OPTARG"
+   case "$optname" in
+      "h")
+         help
+         exit 1
+        ;;
+      "q")
+         export deb2scr="no"
+         quietmode=" -q "
+         debmsg " quiet mode"
+        ;;
+      "0")
+         export deb2scr="yes"
+         export debug="info"
+         quietmode=" -0 "
+         debmsg " info mode"
+        ;;
+      "1")
+         export deb2scr="yes"
+         export debug="debug"
+         quietmode=" -1 "
+         debmsg " debug mode"
+        ;;
+      "2")
+         export deb2scr="yes"
+         export debug="trace"
+         quietmode=" -2 "
+         debmsg " trace mode"
+        ;;
+      "l")
+         export logfile="$OPTARG"
+         debmsg " log: $logfile"
+        ;;
+      "r")
+         export rep_file="report"
+        ;;
+      "o")
+         export rep_file="$OPTARG"
+         debmsg " report output: $rep_file"
+        ;;
+      "n")
+         rep_nohead=0
+        ;;
+      "s")
+         rep_sr=0
+        ;;
+      "v")
+         rep_vm=0
+        ;;
+      "?")
+        errmsg "Unknown option $OPTARG"
+        exit 2
+        ;;
+      ":")
+        errmsg "No argument value for option $OPTARG"
+        exit 2
+        ;;
+      *)
+      # Should not occur
+        errmsg "Unknown error while processing options"
+        ;;
+   esac
+done
+
+if [ $rep_sr -eq 1 ] && [ $rep_vm -eq 1 ] ; then
+   help
+   exit 1
+fi
+
+infmsg "$ls Start $progname $ver"
+
+if [ "$rep_file" != "none" ]; then
+   tracemsg "$ls  check if deploy server already mounted"
+   
+   if [ $retc -eq 0 ]; then
+      /usr/bin/fsimount $quietmode -c
+      retc=$?
+      if [ $retc -eq 0 ]; then
+         tracemsg "$ls  deploy server mount point found"
+      elif [ $retc -eq 1 ]; then
+         debmsg "$ls  deploy server not mounted - try to mount"
+         mounted=1
+         /usr/bin/fsimount $quietmode -m
+         retc=$?
+      else
+         errmsg "cannot check deploy server mountpoint"
+      fi
+   fi   
+   
+   
+   if [ $retc -eq 0 ]; then
+      tracemsg "$ls    ==> fsi deploy server: $fsisrv"
+      tracemsg "$ls    ==> fsi deploy temp mount: $xenmp"
+      tracemsg "$ls    ==> ks mount point: $kspath"
+      tracemsg "$ls    ==> pool: $pool"
+   
+#      viinfopath=$kspath/pool/$pool/info
+      viinfopath=$kspath/pool/$pool
+      tracemsg "$ls    ==> info path: $viinfopath"
+      
+      if [ ! -d $viinfopath ]; then
+         debmsg "$ls  no $viinfopath exist - create it"
+         mkdir $viinfopath > /dev/null 2>&1
+         retc=$?
+         if [ $retc -ne 0 ]; then
+            errmsg "cannot create info dir in pool dir [$viinfopath]"
+         fi
+      fi
+      
+   fi
+   
+#   if [ $retc -eq 0 ]; then
+#      srvinfopath="$viinfopath/"${HOSTNAME%%.*}
+#      tracemsg "$ls  server info path: $srvinfopath"
+#   fi
+#   
+#   if [ $retc -eq 0 ]; then
+#      if [ ! -d $srvinfopath ]; then
+#         debmsg "$ls  create $srvinfopath ..."
+#         mkdir $srvinfopath > /dev/null 2>&1
+#         retc=$?
+#         if [ $retc -ne 0 ]; then
+#            errmsg "cannot create server info dir in log dir [$srvinfopath]"
+#         fi
+#      fi
+#   fi
+fi
+
+if [ $retc -eq 0 ]; then
+   OLDIFS=$IFS
+   IFS="," 
+
+   if [ $rep_vm -eq 0 ] ; then
+      if [ -e "$viinfopath/${rep_file}.vm" ]; then
+         debmsg "$ls   delete old $viinfopath/${rep_file}.vm"
+         rm -f "$viinfopath/${rep_file}.vm"
+      fi
+      debmsg "$ls  start collecting vm hd information"
+      if [ "$rep_file" != "none" ] && [ $rep_nohead -eq 1 ]; then
+         echo "pool,vmname,virt.size,phys.util,srname" >"$viinfopath/${rep_file}.vm"
+      fi
+      
+      vals=$(xe vm-list params=uuid is-control-domain=false --minimal)
+      for i in $vals; do 
+         vmname=$(xe vm-param-get param-name=name-label uuid=$i)
+         vbdlist=$(xe vm-disk-list vm="$vmname" vbd-params= vdi-params=none --minimal)
+         
+         for vbduuid in $vbdlist; do 
+            vdiuuid=$(xe vbd-param-get param-name=vdi-uuid uuid=$vbduuid)
+            srname=$(xe vdi-param-get param-name=sr-name-label uuid=$vdiuuid)
+            virtsize=$(xe vdi-param-get param-name=virtual-size uuid=$vdiuuid)
+            physize=$(xe vdi-param-get param-name=physical-utilisation uuid=$vdiuuid)
+            sruuid=$(xe vdi-param-get param-name=sr-uuid uuid=$vdiuuid)
+            infmsg "$ls   VM: $pool  $vmname = $virtsize / $physize  sr = $srname"
+            if [ "$quietmode" == " -q " ]; then
+               echo "VM: $pool  $vmname = $vdiuuid / $virtsize / $physize / $srname / $sruuid"
+            fi
+            if [ "$rep_file" != "none" ]; then
+               echo "$pool,$vmname,$virtsize,$physize,$srname" >>"$viinfopath/${rep_file}.vm"
+            fi
+         done
+      done
+      
+#      vals=$(xe vm-list params=name-label is-control-domain=false --minimal)
+#      sumsize=0
+#      if [ "$rep_file" != "none" ] && [ $rep_nohead -eq 1 ]; then
+#         echo "vmname,hdsumsize" >"$viinfopath/${rep_file}.vm"
+#      fi
+#      
+#      for i in $vals; do 
+#         hdsize=$(xe vm-disk-list vm="$i" vbd-params=vm-name-label vdi-params=virtual-size --minimal)
+#         read -r -a hd_array <<< "$hdsize"
+#         for element in "${hd_hash[@]}"; do
+#            echo "$element"
+#         done   
+#         vmname=""
+#         hdsumsize=0
+#         hdkeys=${!hd_array[@]}
+#         tracemsg "$ls   HD Index: $hdkeys"
+#         for index in "${!hd_array[@]}"; do
+#            tracemsg "$ls   WERT: ${hd_array[index]} / $nindex"
+#            if [ "$vmname" == "" ]; then
+#               hdsumsize=${hd_array[index]}
+#               tracemsg "$ls    HD size: $hdsumsize"
+#               nindex=$((index+1))
+#               vmname=${hd_array[nindex]}
+#            else
+#               if [ "$vmname" != ${hd_array[index]} ]; then
+#                  hdsize=${hd_array[index]}
+#                  hdsumsize=$((hdsumsize+hdsize))
+#               fi
+#            fi
+#         done
+#         if [ "$quietmode" == " -q " ]; then
+#            echo "$vmname,$hdsumsize"
+#         fi
+#         if [ "$rep_file" != "none" ]; then
+#            echo "$vmname,$hdsumsize" >>"$viinfopath/${rep_file}.vm"
+#         fi
+#         infmsg "$ls   vm: $vmname  => $hdsumsize"
+#         sumsize=$((sumsize+hdsumsize))
+#      done  
+#      infmsg "$ls   => complete size: $sumsize"
+   fi
+   
+   if [ $rep_sr -eq 0 ] ; then
+      debmsg "$ls  start collecting sr hd information"
+      #vals=$(xe sr-list params=name-label --minimal)
+      vals=$(xe sr-list params=uuid --minimal)
+
+      if [ -e "$viinfopath/${rep_file}.sr" ]; then 
+         debmsg "$ls  delete old $viinfopath/${rep_file}.sr"
+         rm -f "$viinfopath/${rep_file}.sr"
+      fi
+      if [ "$rep_file" != "none" ] && [ $rep_nohead -eq 1 ]; then
+         echo "pool,srname,srphysize,srphyutil,srvirtalloc" >"$viinfopath/${rep_file}.sr"
+      fi
+
+      for i in $vals; do 
+         srphysize=$(xe sr-param-get uuid=$i param-name=physical-size)
+         srphyutil=$(xe sr-param-get uuid=$i param-name=physical-utilisation)
+         srvirtalloc=$(xe sr-param-get uuid=$i param-name=virtual-allocation)
+         srname=$(xe sr-param-get uuid=$i param-name=name-label)
+         if [ "$quietmode" == " -q " ]; then
+            echo "$pool,$srname,$srphysize,$srphyutil,$srvirtalloc"
+         fi
+         if [ "$rep_file" != "none" ]; then
+            echo "$pool,$srname,$srphysize,$srphyutil,$srvirtalloc" >>"$viinfopath/${rep_file}.sr"
+         fi
+         infmsg "$ls    pool: $pool  sr: $srname  phy.size:$srphysize  phy.util:$srphyutil  virt.alloc:$srvirtalloc"
+      done
+   fi
+   
+   IFS=$OLDIFS
+   
+   
+   
+fi
+  
+if [ "$rep_file" != "none" ]; then
+   if [ $mounted -eq 1 ]; then
+      infmsg "$ls  fsi deploy server was not mounted at start - unmount now"
+      /usr/bin/fsimount $quietmode -u
+      retc=$?
+   else
+      debmsg "$ls  fsi deploy server was mounted at start - leave it"
+   fi
+fi   
+
+infmsg "$ls End $progname $ver - rc=$retc"
+exit $retc
+   
+

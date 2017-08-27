@@ -1,0 +1,400 @@
+#!/bin/sh
+#
+#   make xenserver vm
+#
+#   This program is free software; you can redistribute it and/or modify it under the
+#   terms of the GNU General Public License as published by the Free Software Foundation;
+#   either version 3 of the License, or (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+#   without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#   See the GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License along with this program;
+#   if not, see <http://www.gnu.org/licenses/>.
+#
+ver="1.0.4 - 10.04.2017"
+retc=0
+ls=""
+progname=${0##*/}
+SOURCE="${BASH_SOURCE[0]}"
+DIR="$( dirname "$SOURCE" )"
+while [ -h "$SOURCE" ]; do
+   SOURCE="$(readlink "$SOURCE")"
+   [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+   DIR="$( cd -P "$( dirname "$SOURCE"  )" && pwd )"
+done
+export progdir="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
+if [ -z $fsifunc ]; then export fsifunc="/usr/bin/fsifunc.sh"; fi
+if [ -f $fsifunc ]; then
+   . $fsifunc
+   . $fsivars
+else
+   echo "ERROR cannot load fsi functions $fsifunc"
+   exit 99
+fi
+if [ -z $logfile ]; then logfile=$fsidir"/"$progname".log"; fi
+
+
+
+function help() {
+   echo
+   tput setaf 2
+   echo " Help for $progname - $ver"
+   tput sgr0
+   echo
+   echo " create vm on xenserver"
+   echo
+   tput setaf 3
+   echo "  Parameter:"
+   tput sgr0
+   echo "   -v <vmname>      vm name"
+   echo "   -n <netname>     network name"
+   echo "   -s <srname>      sr name : if sr count=0 => complete name"
+   echo "                              if sr count>0 => sr=<sr name>_<poolname>_<count>  default count 2"
+   echo
+   tput setaf 3
+   echo "  Optional Parameter:"
+   tput sgr0
+   echo "   -p <number>      how many vms per sr"
+   echo "   -u <number>      sr counts SRNAMExxx default=2"
+   echo "   -m <number>      sr count start number default=1"
+   echo
+   echo "   -o <number>      vm count TESTVMxxx if default=0, no count"
+   echo "   -f <number>      first vm count default=1"
+   echo "   -a <number>      last vm count default=1"
+   echo
+   echo "   -d <number>GiB   hd size default=50GiB"
+   echo "   -r <number>GiB   ram size default=4GiB"
+   echo "   -c <number>      cpu counts default=2"
+   echo "   -k <number>      cores per sockets default=2"
+   echo "   -b <description> description of vm + vmname default=only vmname"
+   echo
+   echo "   -b <bootorder>   bootorder for vm default=ncd"
+   echo
+   echo "   -t <template>    the name of the template you want to use as base default='Other install media'"
+   echo
+   tput setaf 3
+   echo "  Optional Script Parameter:"
+   tput sgr0
+   echo "   -h               help"
+   echo "   -q               quiet mode"
+   echo "   -1               debug mode"
+   echo "   -2               trace mode"
+   echo "   -l <logfile>     other logfile"
+   echo
+   tput setaf 3
+   echo "  Return Code:"
+   tput sgr0
+   echo "    1 = help"
+   echo "    > = different meaning"
+   echo
+   tput setaf 3
+   echo "  Example:"
+   tput sgr0
+   echo "    $progname -v testvm"
+   echo
+}
+
+
+vm_name=""                                                                    # vm name or basename
+sr_name=""                                                                    # sr name or front / typ
+net_name=""                                                                   # target Network name
+
+
+## default parameter
+vms_per_sr=18
+sr_count=2                                                                    # count length - if 0 no count
+sr_start_num=1                                                                # startnumber of count in sr name
+
+vm_count=0                                                                    # vm count TESTVMxxxx
+vm_num_first=1
+vm_num_last=1
+vm_descr=""                                                                   # add $vmname to description
+
+
+param_vm_corespersocket=2                                                     # VM properties
+param_vm_cpucount=2
+param_vm_memory="4GiB"
+param_vdi_size="50GiB"                                                        # VDI properties
+
+param_vm_bootorder="ncd"
+
+
+### fix parameter
+name_template="Other install media"
+
+param_vdi_type="user"
+param_vbd_devicenum=0                                                         # VBD properties
+param_vif_devicenum=0                                                         # VIF properties
+
+
+
+## command line arguments
+while getopts ":v:n:s:p:u:m:o:b:f:a:k:t:c:r:d:b:l:hq12" optname; do
+   #tracemsg "Option $optname has value $OPTARG"
+   case "$optname" in
+      "h")
+         help
+         exit 1
+      ;;
+      "q")
+         export deb2scr="no"
+         quietmode=" -q "
+         debmsg " quiet mode"
+      ;;
+      "1")
+         export deb2scr="yes"
+         export debug="debug"
+         quietmode=" -1 "
+         debmsg " debug mode"
+      ;;
+      "2")
+         export deb2scr="yes"
+         export debug="trace"
+         quietmode=" -2 "
+         debmsg " trace mode"
+      ;;
+      "l")
+         export logfile="$OPTARG"
+         debmsg " log: $logfile"
+      ;;
+      "v")
+         vm_name="$OPTARG"
+      ;;
+      "n")
+         net_name="$OPTARG"
+      ;;
+      "t")
+         name_template="$OPTARG"
+      ;;
+      "s")
+         sr_name="$OPTARG"
+      ;;
+      "p")
+         vms_per_sr="$OPTARG"
+      ;;
+      "u")
+         sr_count="$OPTARG"
+      ;;
+      "m")
+         sr_start_num="$OPTARG"
+      ;;
+      "b")
+         vm_descr="$OPTARG"
+      ;;
+      "o")
+         vm_count="$OPTARG"
+      ;;
+      "f")
+         vm_num_first="$OPTARG"
+      ;;
+      "a")
+         vm_num_last="$OPTARG"
+      ;;
+      "k")
+         param_vm_corespersocket="$OPTARG"
+      ;;
+      "c")
+         param_vm_cpucount="$OPTARG"
+      ;;
+      "r")
+         param_vm_memory="$OPTARG"
+      ;;
+      "d")
+         param_vdi_size="$OPTARG"
+      ;;
+      "b")
+         param_vm_bootorder="$OPTARG"
+      ;;
+      "?")
+         errmsg "Unknown option $OPTARG"
+      ;;
+      ":")
+         errmsg "No argument value for option $OPTARG"
+      ;;
+      *)
+         # Should not occur
+         errmsg "Unknown error while processing options"
+      ;;
+   esac
+done
+
+
+
+## main
+if [ "$vmname" == "" ] && [ "$sr_name" == "" ] && [ "$net_name" == "" ]; then
+   help
+   exit 1
+fi
+
+infmsg "Start $progname - $ver"
+
+tracemsg "$ls  search pool name"
+name_pool="$(xe pool-list params=name-label minimal=true)"
+name_pool_s="$(echo $name_pool | tr [A-Z] [a-z])"
+
+if [ "$name_pool_s" == "" ]; then
+   errmsg "cannot detect pool name"
+   retc=99
+else
+   tracemsg "$ls  pool: $name_pool"
+   
+   if [ $retc -eq 0 ]; then
+      if ! (( $sr_count )); then
+         tracemsg "$ls  no count define, get new sr uuid"
+         output="$(xe sr-list name-label=$sr_name params=uuid minimal=true 2>&1)"
+         if [ -z "$output" ]; then
+            errmsg "Could not retrieve UUID of target SR \"$sr_name\""
+            retc=21
+         fi
+         uuid_sr="$output"
+      fi
+   fi
+   
+   
+   if [ $retc -eq 0 ]; then
+      debmsg "$ls get uuid of network"
+      output="$(xe network-list name-label=$net_name params=uuid minimal=true 2>&1)"
+      if [ -z "$output" ]; then
+         errmsg "Could not retrieve UUID of target network \"$net_name\""
+         retc=22
+      fi
+      uuid_network="$output"
+      tracemsg "$ls  net name: $net_name  uuid: $uuid_network"
+   fi
+   
+   if [ $retc -eq 0 ]; then
+      infmsg "$ls check for availability of the template to use"
+      output="$(xe template-list name-label="$name_template" params=name-label minimal=true 2>&1)"
+      if [ "$output" != "$name_template" ]; then
+         errmsg "Template \"$name_template\" does not exist in this pool"
+         errmsg "Output of xe vm-template-list: [$output]"
+         retc=11
+      fi
+   fi
+   
+   if [ $retc -eq 0 ]; then
+      if !(( $sr_count )); then
+         tracemsg "$ls  get uuid of sr name: $sr_name"
+         output="$(xe sr-list name-label=$sr_name params=uuid minimal=true 2>&1)"
+         if [ -z "$output" ]; then
+            errmsg "Could not retrieve UUID of target SR \"$sr_name\""
+            retc=21
+         fi
+         uuid_sr="$output"
+      fi
+   fi
+   
+   if [ $retc -eq 0 ]; then
+      if [ $vm_num_last -ge $vm_num_first ]; then
+         infmsg "$ls start creating vm ..."
+         for num_vm in $(seq $vm_num_first $vm_num_last); do
+            
+            name_vm="$(printf "$vm_name%.${vm_count}d\n" $num_vm)"
+            debmsg "$ls vm name: $name_vm"
+            
+            infmsg "$ls retrieve UUIDs of SR and Network to use"
+            if (( $sr_count )); then
+               if [ $(( $((num_vm-vm_num_first)) % $vms_per_sr )) -eq 0 ]; then
+                  debmsg "$ls Query UUID of storage repository [num_vm=$num_vm]"
+                  name_sr="$(printf "%s_%s_%.${sr_count}d" $sr_name ${name_pool_s} $sr_start_num)"
+                  let sr_start_num++
+                  output="$(xe sr-list name-label=$name_sr params=uuid minimal=true 2>&1)"
+                  if [ -z "$output" ]; then
+                     errmsg "Could not retrieve UUID of target SR \"$name_sr\""
+                     exit 21
+                  fi
+                  uuid_sr="$output"
+                  tracemsg "$ls sr name: $name_sr  uuid: $uuid_sr"
+               fi
+            fi
+            
+            if [ "$name_vm" = "$(xe vm-list name-label=$name_vm params=name-label minimal=true)" ]; then
+               warnmsg "$ls A worker server with name $name_vm already exists"
+               continue
+            fi
+            
+            infmsg "$ls create VM from template and set VM parameters"
+            output="$(xe vm-install template="$name_template" new-name-label="$name_vm" 2>&1)"
+            retc=$?
+            if [ $retc -ne 0 ]; then
+               errmsg "An error occured while creating VM $name_vm from template \"$name_template\""
+               errmsg "Output of xe vm-install: [$output]"
+               retc=31
+            else
+               uuid_vm="$output"
+               
+               if [ $retc -eq 0 ]; then
+                  infmsg "$ls set vm parameter"
+                  xe vm-param-add uuid=$uuid_vm param-name=tags param-key="VM in pool $name_pool"
+                  xe vm-param-set uuid=$uuid_vm name-description="$vm_descr $name_vm"
+                  xe vm-param-set uuid=$uuid_vm platform:cores-per-socket=$param_vm_corespersocket
+                  xe vm-param-set uuid=$uuid_vm VCPUs-max=$param_vm_cpucount
+                  xe vm-param-set uuid=$uuid_vm VCPUs-at-startup=$param_vm_cpucount
+                  xe vm-param-set uuid=$uuid_vm memory-static-max=$param_vm_memory
+                  xe vm-param-set uuid=$uuid_vm memory-dynamic-max=$param_vm_memory
+                  xe vm-param-set uuid=$uuid_vm memory-dynamic-min=$param_vm_memory
+                  xe vm-param-set uuid=$uuid_vm HVM-boot-params:order=$param_vm_bootorder
+                  xe vm-param-set uuid=$uuid_vm platform:device_id=0002
+               fi
+               
+               if [ $retc -eq 0 ]; then
+                  infmsg "$ls create Virtual Disk and connect it to VM"
+                  output="$(xe vdi-create sr-uuid=$uuid_sr virtual-size="$param_vdi_size" type="$param_vdi_type" name-label="${name_vm}-c" 2>&1)"
+                  if [ $? -ne 0 ]; then
+                     errmsg "An error occured while creating virtual disk image for $name_vm"
+                     errmsg "Output of xe vdi-create for VM $name_vm: [$output]"
+                     retc=32
+                  else
+                     uuid_vdi="$output"
+                     tracemsg "$ls  uuid of vdi: $uuid_vdi"
+                  fi
+               fi
+               
+               if [ $retc -eq 0 ]; then
+                  infmsg "$ls set vdi description"
+                  xe vdi-param-set uuid=$uuid_vdi name-description="Drive C of $name_vm"
+               fi
+               
+               if [ $retc -eq 0 ]; then
+                  output="$(xe vbd-create device=$param_vbd_devicenum vdi-uuid="$uuid_vdi" vm-uuid="$uuid_vm" 2>&1)"
+                  if [ $? -ne 0 ]; then
+                     errmsg "An error occured while creating virtual block device for $name_vm"
+                     errmsg "Output of xe vbd-create: [$output]"
+                     retc=33
+                  fi
+                  uuid_vbd="$output"
+               fi
+               
+               if [ $retc -eq 0 ]; then
+                  infmsg "$ls create Virtual Interface and connect it to VM"
+                  output="$(xe vif-create device=$param_vif_devicenum network-uuid=$uuid_network vm-uuid=$uuid_vm 2>&1)"
+                  if [ $? -ne 0 ]; then
+                     errmsg "An error occured while creating virtual interface for $name_vm"
+                     errmsg "Output of xe vif-create for VM $name_vm: [$output]"
+                     exit 34
+                  fi
+                  uuid_vif="$output"
+               fi
+               if [ $retc -eq 0 ]; then
+                  mac="$(xe vif-param-get param-name="MAC" uuid=$uuid_vif)"
+               fi
+               
+               if [ $retc -eq 0 ]; then
+                  echo "$name_vm;$mac" >>"$logfile.mac"
+                  infmsg "$ls  created: $name_vm [$mac]"
+               fi
+            fi
+         done
+      else
+         errmsg "last vm count is not equal or greater than first vm count [first: $vm_num_first / last: $vm_num_last]"
+         retc=99
+      fi
+   fi
+fi
+
+
+infmsg "End $progname rc=$retc"
+exit $retc
+
